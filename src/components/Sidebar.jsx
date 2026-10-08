@@ -1,8 +1,31 @@
 import { LAYERS } from '../lib/layers';
 
+export function Legend({ flows }) {
+  return (
+    <section>
+      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">Legend</h3>
+      <ul className="space-y-1.5 text-xs text-slate-300">
+        {Object.entries(flows).map(([key, flow]) => (
+          <li key={key} className="flex items-center gap-2">
+            <span className="h-0.5 w-6 rounded" style={{ background: flow.color }} />
+            {flow.label}
+          </li>
+        ))}
+      </ul>
+      <ul className="mt-3 flex flex-wrap gap-1.5">
+        {Object.entries(LAYERS).map(([key, layer]) => (
+          <li key={key} className={`rounded px-1.5 py-0.5 text-[11px] ${layer.chip}`}>
+            {layer.label}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export default function Sidebar({ system, activeStep, onStepChange }) {
   return (
-    <aside className="flex max-h-[40vh] flex-col gap-5 overflow-y-auto border-t border-slate-800 bg-slate-950 p-4 md:max-h-none md:w-80 md:border-t-0 md:border-l">
+    <aside className="flex w-80 flex-col gap-5 overflow-y-auto border-l border-slate-800 bg-slate-950 p-4">
       <section>
         <h2 className="text-base font-semibold text-slate-100">{system.title}</h2>
         <p className="mt-1 text-sm leading-relaxed text-slate-400">{system.summary}</p>
@@ -10,7 +33,7 @@ export default function Sidebar({ system, activeStep, onStepChange }) {
 
       <section>
         <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">Request walkthrough</h3>
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">Walkthrough</h3>
           {activeStep != null && (
             <button type="button" onClick={() => onStepChange(null)} className="text-xs text-sky-400 hover:text-sky-300">
               Show all
@@ -41,24 +64,7 @@ export default function Sidebar({ system, activeStep, onStepChange }) {
         </ol>
       </section>
 
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">Legend</h3>
-        <ul className="space-y-1.5 text-xs text-slate-300">
-          {Object.entries(system.flows).map(([key, flow]) => (
-            <li key={key} className="flex items-center gap-2">
-              <span className="h-0.5 w-6 rounded" style={{ background: flow.color }} />
-              {flow.label}
-            </li>
-          ))}
-        </ul>
-        <ul className="mt-3 flex flex-wrap gap-1.5">
-          {Object.entries(LAYERS).map(([key, layer]) => (
-            <li key={key} className={`rounded px-1.5 py-0.5 text-[11px] ${layer.chip}`}>
-              {layer.label}
-            </li>
-          ))}
-        </ul>
-      </section>
+      <Legend flows={system.flows} />
     </aside>
   );
 }

@@ -4,7 +4,7 @@
   "title": "RAG AI Application Architecture",
   "summary": "Retrieval-Augmented Generation grounds an LLM's answer in your own documents. An offline pipeline turns documents into searchable vectors; at question time the system retrieves the most relevant chunks and hands them to the model as context.",
   "flows": {
-    "ingest": { "label": "Ingestion (offline, async)", "color": "#a78bfa" },
+    "ingest": { "label": "Ingestion (offline, async)", "color": "#a78bfa", "animated": false },
     "query": { "label": "Query (online, latency-critical)", "color": "#38bdf8" },
     "response": { "label": "Response stream", "color": "#34d399" }
   },

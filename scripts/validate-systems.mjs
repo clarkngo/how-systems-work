@@ -14,6 +14,9 @@ const nonEmpty = (v) => Array.isArray(v) && v.length > 0;
 
 const { systems } = JSON.parse(readFileSync(join(DIR, 'index.json'), 'utf8'));
 check(new Set(systems.map((s) => s.id)).size === systems.length, 'index.json: duplicate system ids');
+for (const s of systems) {
+  check(s.id && s.title && s.category && s.description, `index.json: "${s.id}" needs id, title, category, description`);
+}
 
 for (const entry of systems.filter((s) => s.file)) {
   const path = join(DIR, entry.file);

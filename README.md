@@ -11,7 +11,7 @@ npm run build      # validates public/systems/*.json, then builds dist/
 ## Adding a system
 
 1. Create `public/systems/<id>.json` (copy `rag-ai.json` as a template).
-2. Add or enable its entry in `public/systems/index.json` by setting `"file": "<id>.json"`.
+2. In `public/systems/index.json`, set `"file": "<id>.json"` on its entry, or add a new entry with `id`, `title`, `category`, and `description`. Entries with `"file": null` show as "coming soon", grouped by category.
 3. Run `npm run validate`. The build fails on dangling edges, unknown layers, or missing fields.
 
 It is then reachable at `#/<id>` and appears in the switcher.
@@ -24,7 +24,7 @@ It is then reachable at `#/<id>` and appears in the switcher.
   "id": "rag-ai",                       // must match index.json
   "title": "…", "summary": "…",
   "flows": {                            // edge categories, used for color and legend
-    "query": { "label": "Query (online)", "color": "#38bdf8" }
+    "query": { "label": "Query (online)", "color": "#38bdf8", "animated": true }  // animated defaults to true
   },
   "walkthrough": [                      // numbered steps; edges opt in via data.steps
     { "step": 1, "title": "…", "text": "…" }

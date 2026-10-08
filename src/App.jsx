@@ -4,6 +4,8 @@ import { useHashRoute } from './hooks/useHashRoute';
 import SystemSwitcher from './components/SystemSwitcher';
 import SystemCanvas from './components/SystemCanvas';
 import Sidebar from './components/Sidebar';
+import MobileView from './components/MobileView';
+import { useIsMobile } from './hooks/useIsMobile';
 
 function Message({ children }) {
   return <div className="flex flex-1 items-center justify-center p-8 text-sm text-slate-400">{children}</div>;
@@ -13,6 +15,7 @@ export default function App() {
   const catalog = useCatalog();
   const [route, navigate] = useHashRoute();
   const [activeStep, setActiveStep] = useState(null);
+  const isMobile = useIsMobile();
 
   const available = catalog.data?.systems.filter((s) => s.file) ?? [];
   const entry = available.find((s) => s.id === route) ?? available[0];
@@ -35,8 +38,10 @@ export default function App() {
         <Message>Could not load system data: {(catalog.error || system.error).message}</Message>
       ) : !system.data || system.loading ? (
         <Message>Loading…</Message>
+      ) : isMobile ? (
+        <MobileView key={system.data.id} system={system.data} activeStep={activeStep} onStepChange={setActiveStep} />
       ) : (
-        <main className="flex min-h-0 flex-1 flex-col md:flex-row">
+        <main className="flex min-h-0 flex-1">
           <div className="min-h-0 flex-1">
             <SystemCanvas key={system.data.id} system={system.data} activeStep={activeStep} />
           </div>
