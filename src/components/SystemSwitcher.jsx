@@ -19,7 +19,7 @@ export default function SystemSwitcher({ systems, value, onChange }) {
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="min-w-0 max-w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-slate-100 focus:border-sky-500 focus:outline-none"
+        className="min-w-0 max-w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-base text-slate-100 sm:text-sm focus:border-sky-500 focus:outline-none"
       >
         {groupByCategory(systems).map(([category, items]) => (
           <optgroup key={category} label={category}>

@@ -11,9 +11,9 @@ export const LAYERS = {
 
 // What the header badge means: how the system behaves when this node is down.
 export const CRITICALITY = {
-  critical: { label: 'Critical path', className: 'bg-red-500/15 text-red-300 ring-red-500/30' },
-  degradable: { label: 'Degradable', className: 'bg-amber-500/15 text-amber-300 ring-amber-500/30' },
-  async: { label: 'Async', className: 'bg-slate-500/20 text-slate-300 ring-slate-500/30' },
+  critical: { label: 'Critical path', className: 'bg-red-500/15 text-red-300 ring-red-500/30', dot: 'bg-red-400' },
+  degradable: { label: 'Degradable', className: 'bg-amber-500/15 text-amber-300 ring-amber-500/30', dot: 'bg-amber-400' },
+  async: { label: 'Async', className: 'bg-slate-500/20 text-slate-300 ring-slate-500/30', dot: 'bg-slate-400' },
 };
 
 export const HANDLE_IDS = ['t', 'r', 'b', 'l'];
