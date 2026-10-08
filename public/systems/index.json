@@ -1,0 +1,15 @@
+{
+  "systems": [
+    {
+      "id": "rag-ai",
+      "title": "RAG AI Application",
+      "category": "AI",
+      "file": "rag-ai.json",
+      "description": "Retrieval-Augmented Generation: ground LLM answers in your own documents."
+    },
+    { "id": "ecommerce-checkout", "title": "E-Commerce Checkout", "category": "Commerce", "file": null },
+    { "id": "payment-gateway", "title": "Payment Gateway", "category": "Fintech", "file": null },
+    { "id": "auth-flow", "title": "Authentication (OIDC)", "category": "Security", "file": null },
+    { "id": "crm-pipeline", "title": "CRM Data Pipeline", "category": "Data", "file": null }
+  ]
+}

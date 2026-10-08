@@ -1,0 +1,338 @@
+{
+  "schemaVersion": 1,
+  "id": "rag-ai",
+  "title": "RAG AI Application Architecture",
+  "summary": "Retrieval-Augmented Generation grounds an LLM's answer in your own documents. An offline pipeline turns documents into searchable vectors; at question time the system retrieves the most relevant chunks and hands them to the model as context.",
+  "flows": {
+    "ingest": { "label": "Ingestion (offline, async)", "color": "#a78bfa" },
+    "query": { "label": "Query (online, latency-critical)", "color": "#38bdf8" },
+    "response": { "label": "Response stream", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "User asks a question", "text": "The chat UI POSTs the query with the user's JWT to the gateway, which authenticates, rate-limits, and opens an SSE stream back to the browser." },
+    { "step": 2, "title": "Embed the query", "text": "The orchestrator condenses follow-up questions using chat history, then sends the query text to the same embeddings model used at ingestion time." },
+    { "step": 3, "title": "Similarity search", "text": "The query vector, plus an ACL filter derived server-side from the token, is sent to the vector DB, which returns the top-20 nearest chunks." },
+    { "step": 4, "title": "Rerank and assemble", "text": "A cross-encoder reranks the 20 candidates down to about 5, fits them into the token budget, and builds a prompt with numbered, delimited sources." },
+    { "step": 5, "title": "Generate", "text": "The LLM is told to answer only from the supplied context, cite sources as [n], and abstain if the context is insufficient." },
+    { "step": 6, "title": "Stream back", "text": "Tokens stream from the LLM through the gateway to the UI, followed by a final event carrying citations and token usage." }
+  ],
+  "nodes": [
+    {
+      "id": "doc-store",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Source Document Store",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["S3 / GCS", "Confluence", "SharePoint"],
+        "io": {
+          "input": [{ "name": "Uploads / connector sync", "type": "Binary: PDF | HTML | DOCX | MD" }],
+          "output": [{ "name": "Change event", "type": "JSON: { objectKey, etag, mimeType, op: \"put\" | \"delete\", acl: string[] }" }]
+        },
+        "responsibilities": [
+          "System of record for raw source documents and their access-control lists.",
+          "Emits create, update, and delete events that trigger re-ingestion.",
+          "Versions objects (etag) so unchanged documents are not re-embedded."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Connector sync silently stalls",
+            "impact": "Index goes stale; users get confident answers from outdated policy docs.",
+            "mitigation": "Freshness SLO on lastSyncedAt per source, with alerting."
+          },
+          {
+            "scenario": "Delete or ACL change is not propagated",
+            "impact": "Revoked or deleted content keeps appearing in answers, which is a compliance incident.",
+            "mitigation": "Tombstone events plus delete-by-docId in the vector DB; periodic reconciliation job."
+          }
+        ]
+      }
+    },
+    {
+      "id": "chunker",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Document Chunking Processor",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Unstructured", "LangChain splitters", "SQS workers"],
+        "io": {
+          "input": [{ "name": "Change event + raw bytes", "type": "JSON: { objectKey, mimeType } + Binary" }],
+          "output": [{ "name": "Chunks", "type": "JSON: Chunk[] { chunkId, docId, text, tokenCount, metadata: { title, page, section, acl[] } }" }]
+        },
+        "responsibilities": [
+          "Extracts text from each format, including tables and OCR for scanned pages.",
+          "Splits on document structure (headings, paragraphs) into 300 to 800 token chunks with about 15% overlap.",
+          "Derives a deterministic chunkId = hash(docId + offset) so upserts are idempotent."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Parser fails on a scanned PDF or complex table",
+            "impact": "Empty or garbled chunks; the document is effectively invisible to search.",
+            "mitigation": "OCR fallback, alert on zero-text docs, route failures to a dead-letter queue."
+          },
+          {
+            "scenario": "Poison message retried forever",
+            "impact": "Ingestion queue backs up and all new documents are delayed.",
+            "mitigation": "Max-receive count with DLQ; ingestion lag dashboard."
+          },
+          {
+            "scenario": "Answer split across a chunk boundary",
+            "impact": "Neither half scores well; retrieval misses the answer.",
+            "mitigation": "Structure-aware splitting plus overlap; consider parent-document retrieval."
+          }
+        ]
+      }
+    },
+    {
+      "id": "embeddings",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Embeddings API",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["text-embedding-3-small", "Voyage", "Cohere Embed"],
+        "io": {
+          "input": [{ "name": "Texts to embed", "type": "JSON: { model, input: string[] }" }],
+          "output": [{ "name": "Embeddings", "type": "Vector Array: float32[1536] per input" }]
+        },
+        "responsibilities": [
+          "Maps text into a shared semantic vector space where similar meaning means nearby vectors.",
+          "Serves two workloads: bulk batches (ingestion) and single, latency-sensitive calls (queries).",
+          "Model and version must be identical on both paths, or the vectors are not comparable."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bulk re-index hits 429 rate limits",
+            "impact": "Ingestion throttling starves live query traffic sharing the same quota.",
+            "mitigation": "Separate API keys or quotas per path; exponential backoff with jitter."
+          },
+          {
+            "scenario": "Provider outage",
+            "impact": "Queries cannot be embedded, so retrieval is impossible.",
+            "mitigation": "Degraded mode using BM25 keyword search; circuit breaker."
+          },
+          {
+            "scenario": "Model upgraded on only one path",
+            "impact": "Query vectors no longer match stored vectors; relevance collapses with no errors raised.",
+            "mitigation": "Put the model version in the index name; re-embed into a new index, then swap blue/green."
+          }
+        ]
+      }
+    },
+    {
+      "id": "vector-db",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Vector Database",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["pgvector", "Pinecone", "Qdrant", "Weaviate"],
+        "io": {
+          "input": [
+            { "name": "Upsert", "type": "JSON: { id, values: float32[1536], metadata }" },
+            { "name": "Query", "type": "JSON: { vector: float32[1536], topK: 20, filter: { acl: { $in: userGroups } } }" }
+          ],
+          "output": [{ "name": "Matches", "type": "JSON: Match[] { id, score, metadata: { text, docId, title } }" }]
+        },
+        "responsibilities": [
+          "Approximate nearest-neighbour search (e.g. HNSW) over millions of vectors in milliseconds.",
+          "Applies metadata filters (tenant, ACL, date) inside the search, not after it.",
+          "Optionally runs hybrid dense + sparse (keyword) retrieval for exact terms such as SKUs and error codes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Timeout or unavailable",
+            "impact": "No context. The real risk is the LLM answering anyway, ungrounded.",
+            "mitigation": "Fail closed: return an explicit 'cannot answer right now'; never call the LLM without context silently."
+          },
+          {
+            "scenario": "ACL filter missing or client-supplied",
+            "impact": "Cross-tenant data leak through generated answers.",
+            "mitigation": "Derive the filter server-side from the verified token; add tests that assert the filter is present."
+          },
+          {
+            "scenario": "Post-filtering after topK",
+            "impact": "Restrictive filters return zero results even though matches exist.",
+            "mitigation": "Use filtered (pre-filter) ANN search supported by the engine."
+          }
+        ]
+      }
+    },
+    {
+      "id": "chat-ui",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Chat Client UI",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["React", "fetch + ReadableStream"],
+        "io": {
+          "input": [{ "name": "Answer stream", "type": "SSE: { delta: string } … { done: true, citations: Citation[] }" }],
+          "output": [{ "name": "Chat request", "type": "JSON: { query: string, conversationId: string } + Authorization: Bearer <JWT>" }]
+        },
+        "responsibilities": [
+          "Captures the question and conversation ID and sends them with the user's token.",
+          "Renders streamed tokens incrementally so first output appears in under a second.",
+          "Shows citations linking to source chunks, and collects thumbs-up/down feedback for evaluation."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Stream drops mid-answer",
+            "impact": "A truncated answer looks complete to the user.",
+            "mitigation": "Treat a missing done event as an error; show 'answer interrupted' with retry."
+          },
+          {
+            "scenario": "Double submit",
+            "impact": "Duplicate LLM calls double the cost.",
+            "mitigation": "Idempotency key per message; disable send while streaming."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "API Gateway & RAG Orchestrator",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["FastAPI / Node", "LangGraph", "Redis rate limiter"],
+        "io": {
+          "input": [
+            { "name": "Chat request", "type": "HTTP POST /chat { query, conversationId } + JWT" },
+            { "name": "LLM output", "type": "SSE: token deltas" }
+          ],
+          "output": [
+            { "name": "To embeddings", "type": "JSON: { input: [standaloneQuery] }" },
+            { "name": "To assembler", "type": "JSON: { query, history: Message[], userGroups: string[] }" },
+            { "name": "To client", "type": "text/event-stream" }
+          ]
+        },
+        "responsibilities": [
+          "Authenticates, authorizes, and rate-limits per user and tenant; derives userGroups for ACL filtering.",
+          "Runs the pipeline (embed, retrieve, assemble, generate) with per-step timeouts inside a total deadline.",
+          "Relays the token stream to the client and emits traces with retrieved IDs and token usage."
+        ],
+        "failureModes": [
+          {
+            "scenario": "No end-to-end deadline",
+            "impact": "Slow dependencies pile up open requests until workers are exhausted.",
+            "mitigation": "Deadline budget (e.g. 30s total, 2s retrieve) propagated to every hop."
+          },
+          {
+            "scenario": "Client disconnects, LLM keeps generating",
+            "impact": "Tokens are paid for but never seen.",
+            "mitigation": "Propagate cancellation (AbortController) to the upstream LLM call."
+          },
+          {
+            "scenario": "Gateway instance crashes",
+            "impact": "In-flight streams on that instance drop.",
+            "mitigation": "Stateless, horizontally scaled replicas; conversation state lives in a store, not memory."
+          }
+        ]
+      }
+    },
+    {
+      "id": "context-assembler",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Context Assembler & Reranker",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Cohere Rerank / bge-reranker", "tiktoken"],
+        "io": {
+          "input": [
+            { "name": "Candidates", "type": "JSON: Match[20]" },
+            { "name": "Request context", "type": "JSON: { query, history, userGroups }" }
+          ],
+          "output": [{ "name": "Prompt", "type": "JSON: { system: string, messages: Message[], sources: chunkId[] }" }]
+        },
+        "responsibilities": [
+          "Reranks the top-20 vector hits with a cross-encoder and keeps about 5 that clear a relevance threshold.",
+          "Deduplicates and fits chunks into a fixed token budget (e.g. 6k) for the context window.",
+          "Wraps retrieved text in delimiters as untrusted data and numbers sources [1]..[n] for citation."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Reranker unavailable",
+            "impact": "Lower answer quality, not an outage.",
+            "mitigation": "Fall back to raw vector-score order; flag the response as degraded in traces."
+          },
+          {
+            "scenario": "Context exceeds the model window",
+            "impact": "LLM returns 400 context_length_exceeded.",
+            "mitigation": "Count tokens before sending; drop the lowest-ranked chunks first."
+          },
+          {
+            "scenario": "Prompt injection inside a retrieved document",
+            "impact": "Document text such as 'ignore previous instructions' hijacks the model.",
+            "mitigation": "Delimit sources, state in the system prompt that they are data, filter outputs."
+          },
+          {
+            "scenario": "No chunk clears the threshold",
+            "impact": "The model hallucinates to fill the gap.",
+            "mitigation": "Short-circuit with 'no relevant information found' instead of calling the LLM."
+          }
+        ]
+      }
+    },
+    {
+      "id": "llm",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "LLM Inference Engine",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Claude", "GPT", "vLLM (self-hosted)"],
+        "io": {
+          "input": [{ "name": "Generation request", "type": "JSON: { model, system, messages[], max_tokens, stream: true }" }],
+          "output": [{ "name": "Completion stream", "type": "SSE: text deltas … { stop_reason, usage: { input_tokens, output_tokens } }" }]
+        },
+        "responsibilities": [
+          "Generates an answer grounded only in the supplied context, citing sources as [n].",
+          "Streams tokens to cut perceived latency (time-to-first-token).",
+          "Reports token usage for per-tenant cost metering."
+        ],
+        "failureModes": [
+          {
+            "scenario": "429 / overloaded",
+            "impact": "Requests fail at peak load.",
+            "mitigation": "Retry with backoff, then fail over to a secondary model or region."
+          },
+          {
+            "scenario": "Hallucinated or fabricated citation",
+            "impact": "Users trust an answer the sources do not support.",
+            "mitigation": "Instruct the model to abstain; verify every [n] maps to a real source before display."
+          },
+          {
+            "scenario": "stop_reason = max_tokens",
+            "impact": "Answer is cut off mid-sentence.",
+            "mitigation": "Surface the truncation to the UI; offer 'continue'."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-doc-chunk", "source": "doc-store", "sourceHandle": "r", "target": "chunker", "targetHandle": "l", "data": { "flow": "ingest", "payload": "change event" } },
+    { "id": "e-chunk-embed", "source": "chunker", "sourceHandle": "r", "target": "embeddings", "targetHandle": "l", "data": { "flow": "ingest", "payload": "Chunk[].text (batched)" } },
+    { "id": "e-embed-upsert", "source": "embeddings", "sourceHandle": "t", "target": "vector-db", "targetHandle": "t", "data": { "flow": "ingest", "payload": "upsert vectors + metadata" } },
+
+    { "id": "e-ui-gw", "source": "chat-ui", "sourceHandle": "r", "target": "gateway", "targetHandle": "l", "data": { "flow": "query", "payload": "POST /chat ⇄ SSE", "steps": [1, 6], "bidirectional": true } },
+    { "id": "e-gw-embed", "source": "gateway", "sourceHandle": "t", "target": "embeddings", "targetHandle": "b", "data": { "flow": "query", "payload": "embed(query)", "steps": [2] } },
+    { "id": "e-embed-vdb", "source": "embeddings", "sourceHandle": "r", "target": "vector-db", "targetHandle": "l", "data": { "flow": "query", "payload": "float32[1536] + ACL filter", "steps": [3] } },
+    { "id": "e-vdb-ctx", "source": "vector-db", "sourceHandle": "b", "target": "context-assembler", "targetHandle": "t", "data": { "flow": "query", "payload": "top-20 matches", "steps": [4] } },
+    { "id": "e-gw-ctx", "source": "gateway", "sourceHandle": "r", "target": "context-assembler", "targetHandle": "l", "data": { "flow": "query", "payload": "query + history + userGroups", "steps": [4] } },
+    { "id": "e-ctx-llm", "source": "context-assembler", "sourceHandle": "r", "target": "llm", "targetHandle": "l", "data": { "flow": "query", "payload": "messages[] (~6k tokens)", "steps": [5] } },
+    { "id": "e-llm-gw", "source": "llm", "sourceHandle": "b", "target": "gateway", "targetHandle": "b", "data": { "flow": "response", "payload": "token stream", "steps": [6] } }
+  ]
+}
