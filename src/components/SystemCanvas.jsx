@@ -16,14 +16,14 @@ const CIRCLED = ['⓪', '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', 
 // Visual styling is derived from edge.data.flow so the JSON stays purely semantic.
 function styleEdge(edge, flows, activeStep) {
   const { flow, payload, steps = [], bidirectional } = edge.data;
-  const color = flows[flow].color;
+  const { color, animated = true } = flows[flow];
   const active = activeStep == null || steps.includes(activeStep);
   const marker = { type: MarkerType.ArrowClosed, color, width: 18, height: 18 };
 
   return {
     ...edge,
     type: 'smoothstep',
-    animated: flow !== 'ingest' && active,
+    animated: animated && active,
     label: `${steps.map((s) => CIRCLED[s]).join('')} ${payload}`.trim(),
     markerEnd: marker,
     markerStart: bidirectional ? marker : undefined,

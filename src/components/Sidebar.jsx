@@ -10,7 +10,7 @@ export default function Sidebar({ system, activeStep, onStepChange }) {
 
       <section>
         <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">Request walkthrough</h3>
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">Walkthrough</h3>
           {activeStep != null && (
             <button type="button" onClick={() => onStepChange(null)} className="text-xs text-sky-400 hover:text-sky-300">
               Show all

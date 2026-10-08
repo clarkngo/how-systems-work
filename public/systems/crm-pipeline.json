@@ -1,0 +1,337 @@
+{
+  "schemaVersion": 1,
+  "id": "crm-pipeline",
+  "title": "CRM Data Pipeline",
+  "summary": "A customer data pipeline joins what users do in the product with what sales knows in the CRM. Product events and CRM record changes stream into a warehouse, are stitched into one customer profile, and the resulting signals (lead score, last active, PQL) are synced back into the CRM so sales can act on them.",
+  "flows": {
+    "events": { "label": "Product events (real-time)", "color": "#38bdf8" },
+    "cdc": { "label": "CRM change data capture", "color": "#a78bfa" },
+    "transform": { "label": "Batch modeling (SQL)", "color": "#fbbf24", "animated": false },
+    "activation": { "label": "Activation (reverse ETL)", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "User action is tracked", "text": "A signed-in user upgrades their plan. The SDK sends a track event and an identify call linking the browser's anonymousId to the userId." },
+    { "step": 2, "title": "Validate and enqueue", "text": "The collector checks the event against the tracking plan, drops duplicates by messageId, enriches it, and writes it to Kafka keyed by user." },
+    { "step": 3, "title": "CRM change captured", "text": "Meanwhile a sales rep updates the Contact's account owner. Salesforce emits a change event; the CDC connector checkpoints its replayId and publishes the change to Kafka." },
+    { "step": 4, "title": "Land in the warehouse", "text": "A sink connector loads both topics into append-only raw tables in the warehouse, in micro-batches every minute or so." },
+    { "step": 5, "title": "Resolve identity and model", "text": "Scheduled dbt models link anonymousId, userId, email, and CRM ContactId into one canonical customer, then compute traits like lead score and product-qualified-lead status." },
+    { "step": 6, "title": "Sync back to the CRM", "text": "Reverse ETL diffs customer_360 against the last sync and upserts only the changed fields into pipeline-owned CRM fields, where reps and routing rules see them." }
+  ],
+  "nodes": [
+    {
+      "id": "web-app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Product App & Web Tracking",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Segment analytics.js", "RudderStack SDK", "iOS / Android SDKs"],
+        "io": {
+          "input": [{ "name": "User interactions", "type": "DOM / app events, login → identify(userId, traits)" }],
+          "output": [{ "name": "Tracked events (batched)", "type": "JSON: { type: \"track\" | \"identify\", event, anonymousId, userId?, properties, messageId, timestamp }" }]
+        },
+        "responsibilities": [
+          "Captures behavioural events (signed up, feature used, plan upgraded) against a stable anonymousId cookie.",
+          "Calls identify() at login so earlier anonymous activity can be linked to the known user.",
+          "Queues and retries in the background so tracking never blocks or slows the UI."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ad blockers and browser privacy features drop client events",
+            "impact": "10 to 30% of browser events silently go missing; funnels undercount.",
+            "mitigation": "Send business-critical events (signup, purchase) server-side, not from the browser."
+          },
+          {
+            "scenario": "Device clock is wrong",
+            "impact": "Events land out of order or on the wrong day.",
+            "mitigation": "Record sentAt alongside timestamp; the collector corrects skew using receivedAt."
+          },
+          {
+            "scenario": "PII leaks into event properties (e.g. email in a URL)",
+            "impact": "Personal data spreads into systems not approved to hold it.",
+            "mitigation": "Property allowlists in the tracking plan; redact known PII patterns at the collector."
+          }
+        ]
+      }
+    },
+    {
+      "id": "collector",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Event Collector API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["RudderStack", "Snowplow collector", "Kafka REST proxy"],
+        "io": {
+          "input": [{ "name": "Event batch", "type": "HTTP POST /v1/batch { batch: Event[] } + write key" }],
+          "output": [{ "name": "Kafka record", "type": "key = anonymousId | userId, value = Event (Avro) + { receivedAt, geo, userAgent }" }]
+        },
+        "responsibilities": [
+          "Authenticates the source's write key and validates each event against the tracking-plan schema.",
+          "Deduplicates by messageId and enriches with server receive time, IP-derived geo, and parsed user agent.",
+          "Partitions by user key so each user's events stay in order downstream."
+        ],
+        "failureModes": [
+          {
+            "scenario": "A new app release sends events that break the schema",
+            "impact": "Malformed rows reach the warehouse and break dashboards.",
+            "mitigation": "Route violations to a quarantine topic; alert when the violation rate spikes."
+          },
+          {
+            "scenario": "Kafka is unreachable",
+            "impact": "Events are dropped if the collector answers 2xx without persisting them.",
+            "mitigation": "Return 503 so SDKs retry, and buffer to local disk for short outages."
+          },
+          {
+            "scenario": "Client retries resend the same batch",
+            "impact": "Events are double-counted.",
+            "mitigation": "Dedupe on messageId within a time window, and again with MERGE in the warehouse."
+          }
+        ]
+      }
+    },
+    {
+      "id": "crm",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "CRM (System of Record)",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Salesforce", "HubSpot", "Dynamics 365"],
+        "io": {
+          "input": [
+            { "name": "Rep edits", "type": "UI: Account, Contact, Lead, Opportunity updates" },
+            { "name": "Reverse-ETL upserts", "type": "Bulk API: Contact { External_Id__c, Lead_Score__c, PQL__c }" }
+          ],
+          "output": [{ "name": "Change event", "type": "JSON: { ChangeEventHeader: { entityName, changeType, recordIds[], commitTimestamp, changedFields[] }, …fields }" }]
+        },
+        "responsibilities": [
+          "System of record for accounts, contacts, leads, and opportunities, owned and edited by sales.",
+          "Emits a change event for every create, update, delete, and undelete.",
+          "Enforces org-wide API limits (a daily call quota shared by every integration)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Daily API quota exhausted",
+            "impact": "The pipeline and every other integration (email, CPQ, support) stop until the quota resets.",
+            "mitigation": "Per-integration budgets, Bulk API for large reads and writes, alerts on remaining calls."
+          },
+          {
+            "scenario": "Duplicate records are merged in the CRM",
+            "impact": "The losing record ID vanishes; downstream keeps a ghost contact with its history.",
+            "mitigation": "Handle merge events (MasterRecordId) and re-point history to the surviving ID."
+          },
+          {
+            "scenario": "An admin renames or deletes a custom field",
+            "impact": "The connector errors, or the column silently becomes null.",
+            "mitigation": "Schema-change alerts, and a data contract with Sales Ops for fields the pipeline relies on."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cdc",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "CRM Change Data Capture Connector",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Salesforce Pub/Sub API", "Fivetran", "Airbyte"],
+        "io": {
+          "input": [
+            { "name": "Change stream", "type": "gRPC stream: ChangeEvent + replayId" },
+            { "name": "Backfill", "type": "Bulk API 2.0: SOQL query results (CSV)" }
+          ],
+          "output": [{ "name": "Kafka record", "type": "key = recordId, value = { op: \"c\" | \"u\" | \"d\", after, changedFields[], ts }" }]
+        },
+        "responsibilities": [
+          "Subscribes to the CRM change stream and checkpoints the last replayId so it resumes without gaps.",
+          "Runs a full historical backfill with bulk queries first, then switches to incremental changes.",
+          "Maps CRM objects, including custom fields and soft deletes, into typed records."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Connector is down longer than the CRM's event retention (72h for Salesforce)",
+            "impact": "Missed changes can no longer be replayed; the warehouse silently diverges.",
+            "mitigation": "Alert on checkpoint age well before retention; fall back to a full re-sync."
+          },
+          {
+            "scenario": "Formula and rollup fields change without emitting events",
+            "impact": "Derived fields in the warehouse go stale.",
+            "mitigation": "Periodic reconciliation query on SystemModstamp for affected objects."
+          },
+          {
+            "scenario": "Two updates to one record arrive out of order",
+            "impact": "An older value overwrites a newer one.",
+            "mitigation": "Key by recordId (same partition), and apply only if commitTimestamp is newer."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stream",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "Event Stream",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Apache Kafka", "Confluent Schema Registry", "Kinesis"],
+        "io": {
+          "input": [{ "name": "Producer records", "type": "Topics: events.raw, crm.contact.cdc, crm.account.cdc" }],
+          "output": [{ "name": "Consumer reads", "type": "Record batches by (topic, partition, offset)" }]
+        },
+        "responsibilities": [
+          "Durable, per-partition-ordered buffer that decouples producers from slower consumers.",
+          "Retains data (e.g. 7 days) so any consumer can rewind and replay after a bug fix.",
+          "Schema registry blocks producers from publishing incompatible schema changes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Consumer lag keeps growing",
+            "impact": "Warehouse and CRM fields fall hours behind reality.",
+            "mitigation": "Alert on lag in seconds, not offsets; autoscale sink consumers."
+          },
+          {
+            "scenario": "One huge customer creates a hot partition",
+            "impact": "One partition saturates while others idle; throughput caps out.",
+            "mitigation": "Key by user rather than account; add salting for known heavy keys."
+          },
+          {
+            "scenario": "Incompatible schema change reaches consumers",
+            "impact": "Every consumer of the topic crashes on deserialization.",
+            "mitigation": "Registry compatibility mode set to BACKWARD; contract tests in producer CI."
+          }
+        ]
+      }
+    },
+    {
+      "id": "warehouse",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Data Warehouse",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Snowflake", "BigQuery", "Kafka Connect sink"],
+        "io": {
+          "input": [{ "name": "Micro-batch loads", "type": "raw.events (JSON VARIANT), raw.crm_contact, raw.crm_account" }],
+          "output": [{ "name": "Modeled tables", "type": "SQL: marts.customer_360 { canonical_id, email, account_id, lead_score, is_pql, last_active_at, mrr }" }]
+        },
+        "responsibilities": [
+          "Lands raw data append-only with a load timestamp, so any model can be rebuilt from scratch.",
+          "Hosts layered models (raw → staging → marts) as the single source for analytics.",
+          "Serves BI dashboards, analysts, and the reverse-ETL sync."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Sink retries load the same batch twice",
+            "impact": "Inflated event counts and revenue metrics.",
+            "mitigation": "Load with MERGE on messageId / recordId instead of plain INSERT."
+          },
+          {
+            "scenario": "Late-arriving events (offline mobile clients)",
+            "impact": "Yesterday's metrics change after they were reported.",
+            "mitigation": "Incremental models with a lookback window; label recent days as provisional."
+          },
+          {
+            "scenario": "Full-refresh models on growing tables",
+            "impact": "Compute cost and run time grow without limit.",
+            "mitigation": "Incremental materializations, clustering, and per-query cost alerts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "identity",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Identity Resolution & Modeling",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["dbt", "Dagster / Airflow", "SQL"],
+        "io": {
+          "input": [{ "name": "Raw tables", "type": "SQL: raw.events, raw.crm_contact, raw.crm_account" }],
+          "output": [
+            { "name": "Identity graph", "type": "SQL: identity_graph { anonymous_id, user_id, email, crm_contact_id, canonical_id }" },
+            { "name": "Customer profile", "type": "SQL: marts.customer_360" }
+          ]
+        },
+        "responsibilities": [
+          "Links anonymousId, userId, email, and CRM ContactId into connected groups, each with one canonical_id.",
+          "Applies survivorship rules: the CRM wins for name and title, the product wins for activity and plan.",
+          "Computes traits (lead score, PQL flag, MRR) guarded by dbt tests (unique, not_null, relationships)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Over-merging through a shared identifier (support@, shared device)",
+            "impact": "Customers from different companies collapse into one profile and data leaks between them.",
+            "mitigation": "Blocklist generic emails and devices; cap identity-group size and alert on outliers."
+          },
+          {
+            "scenario": "A failing dbt test halts the DAG",
+            "impact": "Marts stop refreshing; the CRM keeps stale scores.",
+            "mitigation": "Classify tests as blocking or warn; alert on mart freshness, not just job status."
+          },
+          {
+            "scenario": "Scoring logic changes in a PR",
+            "impact": "Lead routing to sales reps shifts overnight without anyone noticing.",
+            "mitigation": "In CI, diff key metrics such as the lead-score distribution against production before merge."
+          }
+        ]
+      }
+    },
+    {
+      "id": "reverse-etl",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Reverse ETL (Activation)",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Hightouch", "Census", "custom sync job"],
+        "io": {
+          "input": [{ "name": "Model snapshot", "type": "SQL: SELECT … FROM marts.customer_360, diffed against last sync" }],
+          "output": [{ "name": "CRM upserts", "type": "Bulk API upsert: Contact by External_Id__c { Lead_Score__c, Last_Active__c, PQL__c }" }]
+        },
+        "responsibilities": [
+          "Diffs the current model against the previous sync so only changed rows use API calls.",
+          "Upserts by external ID into dedicated, pipeline-owned CRM fields in API-limit-sized batches.",
+          "Records per-row failures (e.g. CRM validation rules) and retries or reports them."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Feedback loop: the sync's own writes come back through CDC",
+            "impact": "Each sync triggers changes, which trigger another sync; API quota drains.",
+            "mitigation": "Write only to pipeline-owned fields and filter those fields out of the CDC path."
+          },
+          {
+            "scenario": "Field mapping overwrites rep-entered data",
+            "impact": "Sales loses trust in the CRM and in the data team.",
+            "mitigation": "Never write to rep-owned fields; preview diffs (dry run) before enabling a sync."
+          },
+          {
+            "scenario": "CRM validation rules reject some rows",
+            "impact": "Partial sync reported as success; some reps see stale scores.",
+            "mitigation": "Surface row-level errors; alert when the rejection rate passes a threshold."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-collector", "source": "web-app", "sourceHandle": "r", "target": "collector", "targetHandle": "l", "data": { "flow": "events", "payload": "POST /v1/batch", "steps": [1] } },
+    { "id": "e-collector-stream", "source": "collector", "sourceHandle": "r", "target": "stream", "targetHandle": "t", "data": { "flow": "events", "payload": "events.raw (Avro)", "steps": [2] } },
+    { "id": "e-crm-cdc", "source": "crm", "sourceHandle": "r", "target": "cdc", "targetHandle": "l", "data": { "flow": "cdc", "payload": "ChangeEvent + replayId", "steps": [3] } },
+    { "id": "e-cdc-stream", "source": "cdc", "sourceHandle": "r", "target": "stream", "targetHandle": "b", "data": { "flow": "cdc", "payload": "crm.*.cdc", "steps": [3] } },
+    { "id": "e-stream-warehouse", "source": "stream", "sourceHandle": "r", "target": "warehouse", "targetHandle": "l", "data": { "flow": "events", "payload": "sink → raw.* (micro-batch)", "steps": [4] } },
+    { "id": "e-warehouse-identity", "source": "warehouse", "sourceHandle": "t", "target": "identity", "targetHandle": "l", "data": { "flow": "transform", "payload": "read raw.* ⇄ write marts.*", "steps": [5], "bidirectional": true } },
+    { "id": "e-warehouse-retl", "source": "warehouse", "sourceHandle": "b", "target": "reverse-etl", "targetHandle": "l", "data": { "flow": "activation", "payload": "customer_360 diff", "steps": [6] } },
+    { "id": "e-retl-crm", "source": "reverse-etl", "sourceHandle": "b", "target": "crm", "targetHandle": "b", "data": { "flow": "activation", "payload": "upsert Lead_Score__c, PQL__c", "steps": [6] } }
+  ]
+}
