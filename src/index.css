@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+html,
+body {
+  background: #020617;
+}
+
+/* Edge labels and the controls panel follow the dark canvas */
+.react-flow__controls-button {
+  background: #0f172a;
+  border-color: #1e293b;
+  fill: #cbd5e1;
+}
