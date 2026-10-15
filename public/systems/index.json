@@ -1,13 +1,13 @@
 {
   "systems": [
     { "id": "rag-ai", "title": "RAG AI Application", "category": "AI & Machine Learning", "file": "rag-ai.json", "description": "Retrieval-Augmented Generation: ground LLM answers in your own documents." },
-    { "id": "ai-agent", "title": "AI Agent with Tool Use", "category": "AI & Machine Learning", "file": null, "description": "Planner loop, tool calls, memory, and guardrails around an LLM." },
+    { "id": "ai-agent", "title": "AI Agent with Tool Use", "category": "AI & Machine Learning", "file": "ai-agent.json", "description": "Planner loop, tool calls, memory, and guardrails around an LLM." },
     { "id": "llm-serving", "title": "LLM Inference Serving", "category": "AI & Machine Learning", "file": null, "description": "GPU batching, KV cache, token streaming, and autoscaling." },
     { "id": "recommendation-engine", "title": "Recommendation Engine", "category": "AI & Machine Learning", "file": null, "description": "Candidate generation, ranking, and real-time feedback signals." },
     { "id": "ml-training-pipeline", "title": "ML Training & Feature Store", "category": "AI & Machine Learning", "file": null, "description": "Offline/online features, training jobs, model registry, and deployment." },
     { "id": "content-moderation", "title": "Content Moderation Pipeline", "category": "AI & Machine Learning", "file": null, "description": "Classifiers, human review queues, and appeals at scale." },
 
-    { "id": "ecommerce-checkout", "title": "E-Commerce Checkout", "category": "Commerce & Marketplaces", "file": null, "description": "Cart, pricing, tax, inventory reservation, payment, and order creation." },
+    { "id": "ecommerce-checkout", "title": "E-Commerce Checkout", "category": "Commerce & Marketplaces", "file": "ecommerce-checkout.json", "description": "Cart, pricing, tax, inventory reservation, payment, and order creation." },
     { "id": "inventory-orders", "title": "Inventory & Order Management", "category": "Commerce & Marketplaces", "file": null, "description": "Stock across warehouses, reservations, fulfilment, and returns." },
     { "id": "product-search", "title": "Product Search", "category": "Commerce & Marketplaces", "file": null, "description": "Indexing, query parsing, relevance ranking, and facets." },
     { "id": "flash-sale", "title": "Flash Sale / Ticketing", "category": "Commerce & Marketplaces", "file": null, "description": "Virtual waiting rooms, oversell prevention, and traffic spikes." },
@@ -15,14 +15,14 @@
     { "id": "food-delivery", "title": "Food Delivery", "category": "Commerce & Marketplaces", "file": null, "description": "Order routing to restaurants, courier assignment, and ETA prediction." },
     { "id": "hotel-booking", "title": "Hotel & Travel Booking", "category": "Commerce & Marketplaces", "file": null, "description": "Availability search, inventory holds, and supplier integrations." },
 
-    { "id": "payment-gateway", "title": "Payment Gateway", "category": "Fintech", "file": null, "description": "Card authorization, 3-D Secure, capture, settlement, and webhooks." },
+    { "id": "payment-gateway", "title": "Payment Gateway", "category": "Fintech", "file": "payment-gateway.json", "description": "Card authorization, 3-D Secure, capture, settlement, and webhooks." },
     { "id": "fraud-detection", "title": "Real-Time Fraud Detection", "category": "Fintech", "file": null, "description": "Feature lookups, risk scoring, and rule engines in the payment hot path." },
     { "id": "ledger", "title": "Double-Entry Ledger", "category": "Fintech", "file": null, "description": "Immutable journal entries, balances, idempotency, and reconciliation." },
     { "id": "digital-wallet", "title": "Digital Wallet & P2P Transfers", "category": "Fintech", "file": null, "description": "Balances, transfers, KYC, and money movement between banks." },
     { "id": "stock-exchange", "title": "Stock Exchange Matching Engine", "category": "Fintech", "file": null, "description": "Order books, price-time matching, market data feeds, and clearing." },
     { "id": "subscription-billing", "title": "Subscription Billing", "category": "Fintech", "file": null, "description": "Plans, metering, proration, invoicing, and dunning." },
 
-    { "id": "auth-flow", "title": "Authentication (OIDC)", "category": "Security & Identity", "file": null, "description": "Login, authorization code + PKCE, tokens, refresh, and sessions." },
+    { "id": "auth-flow", "title": "Authentication (OIDC)", "category": "Security & Identity", "file": "auth-flow.json", "description": "Login, authorization code + PKCE, tokens, refresh, and sessions." },
     { "id": "enterprise-sso", "title": "Enterprise SSO (SAML)", "category": "Security & Identity", "file": null, "description": "Identity provider federation, assertions, and user provisioning (SCIM)." },
     { "id": "api-rate-limiter", "title": "API Rate Limiter", "category": "Security & Identity", "file": null, "description": "Token buckets, distributed counters, and quota enforcement at the edge." },
     { "id": "secrets-management", "title": "Secrets Management", "category": "Security & Identity", "file": null, "description": "Vaults, envelope encryption, rotation, and short-lived credentials." },
@@ -34,7 +34,7 @@
     { "id": "cdc-replication", "title": "Database Change Data Capture", "category": "Data & Analytics", "file": null, "description": "Reading the write-ahead log to replicate changes to other systems." },
     { "id": "ab-testing", "title": "A/B Testing Platform", "category": "Data & Analytics", "file": null, "description": "Assignment, exposure logging, metrics pipelines, and statistical analysis." },
 
-    { "id": "chat-messaging", "title": "Chat & Messaging", "category": "Social & Media", "file": null, "description": "Persistent connections, message fan-out, delivery receipts, and presence." },
+    { "id": "chat-messaging", "title": "Chat & Messaging", "category": "Social & Media", "file": "chat-messaging.json", "description": "Persistent connections, message fan-out, delivery receipts, and presence." },
     { "id": "news-feed", "title": "Social News Feed", "category": "Social & Media", "file": null, "description": "Fan-out on write vs read, ranking, and timeline caching." },
     { "id": "notifications", "title": "Notification System", "category": "Social & Media", "file": null, "description": "Push, email, and SMS routing with preferences, batching, and retries." },
     { "id": "video-streaming", "title": "Video Streaming (VOD)", "category": "Social & Media", "file": null, "description": "Transcoding ladders, adaptive bitrate, DRM, and CDN delivery." },
@@ -53,7 +53,7 @@
     { "id": "object-storage", "title": "Object Storage", "category": "Infrastructure", "file": null, "description": "Metadata service, erasure coding, replication, and multipart upload." },
     { "id": "job-scheduler", "title": "Distributed Job Scheduler", "category": "Infrastructure", "file": null, "description": "Cron at scale: leases, exactly-once triggering, and retries." },
     { "id": "feature-flags", "title": "Feature Flags", "category": "Infrastructure", "file": null, "description": "Flag evaluation, targeting rules, streaming updates, and kill switches." },
-    { "id": "url-shortener", "title": "URL Shortener", "category": "Infrastructure", "file": null, "description": "ID generation, redirects at scale, and click analytics." },
+    { "id": "url-shortener", "title": "URL Shortener", "category": "Infrastructure", "file": "url-shortener.json", "description": "ID generation, redirects at scale, and click analytics." },
 
     { "id": "maps-navigation", "title": "Maps & Navigation", "category": "Location & IoT", "file": null, "description": "Tile serving, routing graphs, live traffic, and ETA calculation." },
     { "id": "iot-telemetry", "title": "IoT Telemetry Platform", "category": "Location & IoT", "file": null, "description": "Device provisioning, MQTT ingest, time-series storage, and OTA updates." },

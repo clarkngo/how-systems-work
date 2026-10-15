@@ -1,0 +1,298 @@
+{
+  "schemaVersion": 1,
+  "id": "payment-gateway",
+  "title": "Payment Gateway",
+  "summary": "A payment gateway turns a card number into an approved or declined charge in about two seconds. Card data is tokenized before it reaches the merchant, risk is scored, and the request travels through the card network to the issuing bank. Every money movement is recorded in a ledger, and the merchant is told the outcome via webhook.",
+  "flows": {
+    "pci": { "label": "Card data (PCI-scoped)", "color": "#f472b6" },
+    "api": { "label": "Gateway API calls", "color": "#38bdf8" },
+    "network": { "label": "Card network (ISO 8583)", "color": "#fbbf24" },
+    "events": { "label": "Ledger & events", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Tokenize the card", "text": "Hosted fields in the merchant's page send the card number straight to the gateway's vault, which returns a token. The merchant's servers never see the card number." },
+    { "step": 2, "title": "Create the payment", "text": "The merchant's backend calls POST /payments with the token, amount, and an Idempotency-Key, so a retried request can never charge twice." },
+    { "step": 3, "title": "Score the risk", "text": "Within roughly 50ms the risk engine returns allow, challenge (3-D Secure), or block, based on device, velocity, and history." },
+    { "step": 4, "title": "Route and detokenize", "text": "The router chooses an acquirer by card BIN, currency, cost, and current success rates. The card number is decrypted only inside the PCI zone." },
+    { "step": 5, "title": "Network authorization", "text": "An ISO 8583 authorization request travels acquirer → Visa/Mastercard → issuing bank. The issuer checks funds and fraud and returns an approve or decline code." },
+    { "step": 6, "title": "Record the result", "text": "The ledger writes a balanced authorization-hold entry, and the API returns the status to the merchant." },
+    { "step": 7, "title": "Notify the merchant", "text": "A signed payment.succeeded webhook is delivered. Capture, clearing, and payout to the merchant's bank follow over the next 1 to 2 days." }
+  ],
+  "nodes": [
+    {
+      "id": "merchant",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Merchant Checkout & Backend",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Hosted fields / JS SDK", "Server SDK"],
+        "io": {
+          "input": [
+            { "name": "Payment status", "type": "JSON: { id, status: \"succeeded\" | \"requires_action\" | \"failed\", decline_code? }" },
+            { "name": "Webhooks", "type": "POST merchant.com/webhooks (signed)" }
+          ],
+          "output": [{ "name": "Create payment", "type": "POST /v1/payments { token, amount: 4999, currency: \"usd\" } + Idempotency-Key" }]
+        },
+        "responsibilities": [
+          "Embeds hosted card fields (iframe) so raw card data bypasses the merchant entirely.",
+          "Creates the payment from its backend with a secret API key and an idempotency key.",
+          "Fulfils orders based on webhooks, not on the browser redirect."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Timeout on POST /payments, then a naive retry",
+            "impact": "The customer is charged twice.",
+            "mitigation": "Retry with the same Idempotency-Key; the gateway returns the original result."
+          },
+          {
+            "scenario": "Secret API key leaked in frontend code",
+            "impact": "Attackers can issue refunds or read payment data.",
+            "mitigation": "Publishable vs secret keys, restricted-scope keys, automated secret scanning."
+          }
+        ]
+      }
+    },
+    {
+      "id": "vault",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Card Vault (Tokenization)",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["HSM / KMS", "Isolated PCI DSS network"],
+        "io": {
+          "input": [{ "name": "Card details", "type": "TLS: { number, exp_month, exp_year, cvc }" }],
+          "output": [{ "name": "Token", "type": "JSON: { token: \"tok_…\", brand, last4, fingerprint }" }]
+        },
+        "responsibilities": [
+          "Encrypts card numbers with HSM-managed keys and returns opaque tokens.",
+          "Keeps the PCI-audited surface tiny: only the vault and router ever handle raw card numbers.",
+          "Computes a card fingerprint so risk can recognise the same card across merchants without seeing it."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Vault unavailable",
+            "impact": "No new cards can be tokenized or charged: a full payment outage.",
+            "mitigation": "Multi-region active-active vault; separate deploy cadence from the rest of the platform."
+          },
+          {
+            "scenario": "CVC stored after authorization",
+            "impact": "PCI DSS violation; breach liability.",
+            "mitigation": "CVC held in memory only for the authorization, then discarded; audited in code review."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Payments API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["API gateway", "Postgres (idempotency)", "Rate limiter"],
+        "io": {
+          "input": [{ "name": "Create payment", "type": "HTTP POST /v1/payments + Authorization: Bearer sk_… + Idempotency-Key" }],
+          "output": [
+            { "name": "To risk", "type": "JSON: { amount, fingerprint, ip, deviceId, merchantId }" },
+            { "name": "To router", "type": "JSON: { paymentId, token, amount, currency, merchantId }" }
+          ]
+        },
+        "responsibilities": [
+          "Authenticates the merchant's API key and enforces per-merchant rate limits.",
+          "Stores (idempotencyKey, request hash) → response, and rejects reuse of a key with a different body.",
+          "Drives the payment state machine: created → authorized → captured → refunded."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Crash after the issuer approved but before saving",
+            "impact": "Money is held on the customer's card but the payment looks failed.",
+            "mitigation": "Persist intent before calling out; a reconciler resolves 'unknown' states with the acquirer."
+          },
+          {
+            "scenario": "Merchant traffic spike (sale event)",
+            "impact": "Noisy neighbour degrades every merchant.",
+            "mitigation": "Per-merchant concurrency limits and isolated worker pools for top merchants."
+          }
+        ]
+      }
+    },
+    {
+      "id": "risk",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Fraud & Risk Engine",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Gradient-boosted model", "Feature store (Redis)", "Rules engine"],
+        "io": {
+          "input": [{ "name": "Scoring request", "type": "JSON: { amount, fingerprint, ip, deviceId, merchantId, email }" }],
+          "output": [{ "name": "Decision", "type": "JSON: { score: 0.0-1.0, action: \"allow\" | \"3ds\" | \"block\", reasons[] }" }]
+        },
+        "responsibilities": [
+          "Looks up real-time features (card velocity, IP reputation, device history) in a few milliseconds.",
+          "Combines an ML score with merchant-configurable rules into allow, challenge, or block.",
+          "Learns from chargebacks and disputes that arrive weeks later."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Risk engine times out",
+            "impact": "Blocking all payments loses revenue; allowing all invites fraud.",
+            "mitigation": "Hard latency budget (~50ms), then fall back to a conservative rules-only decision."
+          },
+          {
+            "scenario": "Model drift after a new fraud pattern",
+            "impact": "Fraud rate climbs, or good customers are declined.",
+            "mitigation": "Shadow-score new models; monitor approval and fraud rates per segment daily."
+          }
+        ]
+      }
+    },
+    {
+      "id": "router",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Payment Router & Acquirer Connectors",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["ISO 8583 / acquirer APIs", "Circuit breakers"],
+        "io": {
+          "input": [{ "name": "Authorize", "type": "JSON: { paymentId, token, amount, currency }" }],
+          "output": [
+            { "name": "Auth request", "type": "ISO 8583 MTI 0100 { PAN, expiry, amount, MCC, STAN }" },
+            { "name": "Ledger entry", "type": "JSON: { paymentId, type: \"auth_hold\", amount, authCode }" }
+          ]
+        },
+        "responsibilities": [
+          "Chooses an acquirer by BIN, region, cost, and live success rate; retries soft declines elsewhere.",
+          "Detokenizes inside the PCI zone and translates to each acquirer's protocol.",
+          "Maps dozens of issuer response codes to a clean decline_code for merchants."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Acquirer degraded (slow or high error rate)",
+            "impact": "Authorization rate drops for every payment routed there.",
+            "mitigation": "Circuit breaker per acquirer; fail over to a secondary acquirer on soft declines."
+          },
+          {
+            "scenario": "Network timeout: approval status unknown",
+            "impact": "Charging again may double-charge; giving up may lose a real authorization.",
+            "mitigation": "Send a reversal (MTI 0400) for timed-out requests before any retry."
+          }
+        ]
+      }
+    },
+    {
+      "id": "network",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Card Network & Issuing Bank",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Visa / Mastercard", "Issuer processors"],
+        "io": {
+          "input": [{ "name": "Auth request", "type": "ISO 8583 0100 (via acquirer)" }],
+          "output": [{ "name": "Auth response", "type": "ISO 8583 0110 { responseCode: \"00\" | \"05\" | \"51\", authCode }" }]
+        },
+        "responsibilities": [
+          "Routes the request from the acquiring bank to the cardholder's issuing bank.",
+          "The issuer checks available credit, card status, and its own fraud models, then approves or declines.",
+          "Runs clearing and settlement in daily batches that move the actual money."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Issuer stand-in processing during an outage",
+            "impact": "The network approves on the issuer's behalf with limits; some approvals are reversed later.",
+            "mitigation": "Track stand-in approvals; reconcile against clearing files."
+          },
+          {
+            "scenario": "Generic declines (code 05 'do not honor')",
+            "impact": "Lost sales with no actionable reason.",
+            "mitigation": "Network tokens and account-updater services to reduce stale-card declines; smart retries."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ledger",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Double-Entry Ledger",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres (append-only)", "Reconciliation jobs"],
+        "io": {
+          "input": [{ "name": "Ledger entry", "type": "JSON: { paymentId, type, amount, currency, idempotencyKey }" }],
+          "output": [{ "name": "Balance events", "type": "Event: payment.succeeded | payment.captured | payout.paid" }]
+        },
+        "responsibilities": [
+          "Records every money movement as balanced debits and credits; entries are never updated or deleted.",
+          "Derives merchant balances, fees, and payouts from entries, never from mutable counters.",
+          "Reconciles daily against acquirer settlement files to catch any mismatch."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Duplicate entry from a retried write",
+            "impact": "Merchant overpaid; books don't balance.",
+            "mitigation": "Unique idempotency key per entry; invariant check that each transaction sums to zero."
+          },
+          {
+            "scenario": "Settlement file disagrees with the ledger",
+            "impact": "Money missing or unaccounted for.",
+            "mitigation": "Automated reconciliation with a break queue that finance works through daily."
+          }
+        ]
+      }
+    },
+    {
+      "id": "webhooks",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 240 },
+      "data": {
+        "label": "Webhook Delivery",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Queue + workers", "HMAC signatures"],
+        "io": {
+          "input": [{ "name": "Events", "type": "Event: { id, type, created, data }" }],
+          "output": [{ "name": "Merchant callback", "type": "POST merchant.com/webhooks + Stripe-Signature: t=…,v1=HMAC" }]
+        },
+        "responsibilities": [
+          "Delivers each event at least once, retrying with exponential backoff for up to ~3 days.",
+          "Signs payloads with a per-merchant secret and timestamp to block spoofing and replays.",
+          "Isolates slow merchant endpoints so they can't delay delivery to others."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Merchant endpoint down for hours",
+            "impact": "Orders unfulfilled; a retry storm when it recovers.",
+            "mitigation": "Per-endpoint queues and backoff; events API so merchants can catch up by polling."
+          },
+          {
+            "scenario": "Merchant treats delivery order as event order",
+            "impact": "A late 'failed' overwrites 'succeeded'.",
+            "mitigation": "Docs and SDKs encourage refetching the object; events carry a created timestamp."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-merchant-vault", "source": "merchant", "sourceHandle": "t", "target": "vault", "targetHandle": "t", "data": { "flow": "pci", "payload": "card → token (hosted fields)", "steps": [1], "bidirectional": true } },
+    { "id": "e-merchant-api", "source": "merchant", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "api", "payload": "POST /payments ⇄ status", "steps": [2, 6], "bidirectional": true } },
+    { "id": "e-api-risk", "source": "api", "sourceHandle": "b", "target": "risk", "targetHandle": "l", "data": { "flow": "api", "payload": "score ⇄ allow | 3ds | block", "steps": [3], "bidirectional": true } },
+    { "id": "e-api-router", "source": "api", "sourceHandle": "r", "target": "router", "targetHandle": "l", "data": { "flow": "api", "payload": "authorize(token, amount)", "steps": [4] } },
+    { "id": "e-router-vault", "source": "router", "sourceHandle": "t", "target": "vault", "targetHandle": "r", "data": { "flow": "pci", "payload": "detokenize (PCI zone)", "steps": [4], "bidirectional": true } },
+    { "id": "e-router-network", "source": "router", "sourceHandle": "r", "target": "network", "targetHandle": "l", "data": { "flow": "network", "payload": "ISO 8583 0100 ⇄ 0110", "steps": [5], "bidirectional": true } },
+    { "id": "e-router-ledger", "source": "router", "sourceHandle": "b", "target": "ledger", "targetHandle": "l", "data": { "flow": "events", "payload": "auth_hold entry", "steps": [6] } },
+    { "id": "e-ledger-webhooks", "source": "ledger", "sourceHandle": "r", "target": "webhooks", "targetHandle": "l", "data": { "flow": "events", "payload": "payment.succeeded", "steps": [7] } }
+  ]
+}

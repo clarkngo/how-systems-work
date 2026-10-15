@@ -1,0 +1,269 @@
+{
+  "schemaVersion": 1,
+  "id": "auth-flow",
+  "title": "Authentication (OIDC)",
+  "summary": "OpenID Connect lets an app sign users in without ever handling their password. The browser is redirected to an identity provider, which authenticates the user and returns a one-time code. The app's backend exchanges that code for tokens, keeps them server-side, and gives the browser only an HttpOnly session cookie. APIs then verify signed access tokens without calling the identity provider.",
+  "flows": {
+    "session": { "label": "Browser ⇄ app backend (cookie session)", "color": "#38bdf8" },
+    "redirect": { "label": "Front-channel redirects", "color": "#fbbf24" },
+    "backchannel": { "label": "Back-channel (server-to-server)", "color": "#a78bfa" },
+    "idp": { "label": "User authentication", "color": "#f472b6" },
+    "api": { "label": "API access with tokens", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Start login", "text": "The browser hits /login on the app backend (BFF). It generates a random state, a nonce, and a PKCE code_verifier, stores them in a short-lived pre-auth session, and redirects to the identity provider." },
+    { "step": 2, "title": "Authorization request", "text": "The browser follows the redirect to /authorize with client_id, redirect_uri, scope=openid, state, nonce, and code_challenge = SHA-256(code_verifier)." },
+    { "step": 3, "title": "Authenticate the user", "text": "The identity provider checks the password against a slow hash, runs MFA such as a passkey, applies lockout rules, and starts its own single sign-on session." },
+    { "step": 4, "title": "Callback with a code", "text": "The identity provider redirects back to the BFF's /callback?code=…&state=…. The BFF rejects the request unless state matches what it stored in step 1." },
+    { "step": 5, "title": "Exchange the code", "text": "Server to server, the BFF posts the code plus code_verifier to /token and receives an id_token, a short-lived access_token, and a refresh_token. It validates the id_token's signature, issuer, audience, expiry, and nonce." },
+    { "step": 6, "title": "Call an API", "text": "The browser sends only its HttpOnly, SameSite session cookie. The BFF attaches the access token, and the API verifies the JWT signature locally using cached public keys (JWKS)." },
+    { "step": 7, "title": "Refresh silently", "text": "When the access token expires, the BFF exchanges the refresh token for new tokens. Refresh tokens rotate on every use, and reuse of an old one revokes the whole session." }
+  ],
+  "nodes": [
+    {
+      "id": "browser",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Browser (SPA)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["React SPA", "HttpOnly cookies"],
+        "io": {
+          "input": [
+            { "name": "Redirects", "type": "HTTP 302 Location: idp/authorize?… | app/callback?code&state" },
+            { "name": "Session cookie", "type": "Set-Cookie: sid=…; HttpOnly; Secure; SameSite=Lax" }
+          ],
+          "output": [{ "name": "API calls", "type": "fetch('/api/…', { credentials: 'include' })" }]
+        },
+        "responsibilities": [
+          "Follows redirects between the app and the identity provider; never sees tokens in this pattern.",
+          "Sends the HttpOnly session cookie, which JavaScript (including injected XSS) cannot read.",
+          "Sends a CSRF token header on state-changing requests."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Tokens stored in localStorage (the pattern this design avoids)",
+            "impact": "Any XSS bug can exfiltrate long-lived tokens.",
+            "mitigation": "Keep tokens server-side in the BFF; the browser holds only an opaque session ID."
+          },
+          {
+            "scenario": "Third-party cookie blocking breaks silent renew in iframes",
+            "impact": "Users are logged out unexpectedly.",
+            "mitigation": "BFF refreshes server-side; no hidden-iframe renewal needed."
+          }
+        ]
+      }
+    },
+    {
+      "id": "bff",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "App Backend (BFF)",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["openid-client / Spring Security", "Redis session store"],
+        "io": {
+          "input": [
+            { "name": "Browser requests", "type": "GET /login | GET /callback?code&state | /api/* + cookie" },
+            { "name": "Tokens", "type": "JSON: { id_token, access_token, refresh_token, expires_in }" }
+          ],
+          "output": [
+            { "name": "Token request", "type": "POST /token { grant_type: authorization_code, code, code_verifier, client_id } + client auth" },
+            { "name": "API request", "type": "Authorization: Bearer <access_token JWT>" }
+          ]
+        },
+        "responsibilities": [
+          "Acts as a confidential OAuth client; generates state, nonce, and PKCE values and verifies them on callback.",
+          "Validates the id_token, then stores tokens in a server-side session keyed by an opaque cookie.",
+          "Proxies API calls with the access token and refreshes it before expiry."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Callback accepted without checking state",
+            "impact": "Login CSRF: the victim is logged in to the attacker's account.",
+            "mitigation": "Reject any callback whose state doesn't match the pre-auth session; make state single-use."
+          },
+          {
+            "scenario": "Session store (Redis) lost",
+            "impact": "Every user is logged out at once.",
+            "mitigation": "Replicated store; the IdP's SSO session lets users sign back in with one click."
+          }
+        ]
+      }
+    },
+    {
+      "id": "idp",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Authorization Server (IdP)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Keycloak", "Auth0 / Okta", "Amazon Cognito"],
+        "io": {
+          "input": [
+            { "name": "Authorize", "type": "GET /authorize?response_type=code&client_id&redirect_uri&scope&state&nonce&code_challenge" },
+            { "name": "Token", "type": "POST /token (code + code_verifier | refresh_token)" }
+          ],
+          "output": [{ "name": "Tokens", "type": "JWT id_token { iss, sub, aud, exp, nonce } + access_token + refresh_token" }]
+        },
+        "responsibilities": [
+          "Authenticates users and maintains its own SSO session across all apps.",
+          "Issues one-time codes bound to the PKCE challenge, and only to pre-registered, exact-match redirect URIs.",
+          "Signs tokens with a private key and rotates refresh tokens, detecting reuse."
+        ],
+        "failureModes": [
+          {
+            "scenario": "IdP outage",
+            "impact": "Nobody can log in; existing sessions keep working until their tokens expire.",
+            "mitigation": "Multi-region IdP; access tokens long enough to ride out short blips (5-15 min)."
+          },
+          {
+            "scenario": "Wildcard or loosely matched redirect URI",
+            "impact": "Authorization codes leak to an attacker-controlled URL.",
+            "mitigation": "Exact string matching of registered redirect URIs; PKCE makes stolen codes useless."
+          }
+        ]
+      }
+    },
+    {
+      "id": "users",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "User Directory",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres", "LDAP / Active Directory"],
+        "io": {
+          "input": [{ "name": "Credential check", "type": "JSON: { username, password }" }],
+          "output": [{ "name": "Identity", "type": "JSON: { sub, email, email_verified, groups[], mfa_enrolled[] }" }]
+        },
+        "responsibilities": [
+          "Stores password hashes using a deliberately slow algorithm (Argon2id or bcrypt) with a per-user salt.",
+          "Holds profile claims and group memberships that become token claims.",
+          "Tracks failed attempts for lockout and credential-stuffing detection."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Credential-stuffing attack",
+            "impact": "Accounts with reused passwords are taken over.",
+            "mitigation": "Rate limits per IP and account, breached-password checks, mandatory MFA."
+          },
+          {
+            "scenario": "Different responses for unknown users vs wrong passwords",
+            "impact": "Attackers can enumerate valid accounts.",
+            "mitigation": "Identical responses and timing for both cases."
+          }
+        ]
+      }
+    },
+    {
+      "id": "mfa",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "MFA / Passkeys",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["WebAuthn passkeys", "TOTP apps", "Twilio Verify (SMS)"],
+        "io": {
+          "input": [{ "name": "Challenge request", "type": "JSON: { sub, factor: \"webauthn\" | \"totp\" | \"sms\" }" }],
+          "output": [{ "name": "Assertion result", "type": "JSON: { verified: boolean, factor, amr: [\"pwd\", \"hwk\"] }" }]
+        },
+        "responsibilities": [
+          "Issues a WebAuthn challenge that the user's device signs; the signature is bound to the origin, so it is phishing-resistant.",
+          "Verifies time-based one-time codes, or sends SMS codes as a weak fallback.",
+          "Records which factors were used (amr claim) so apps can demand step-up for sensitive actions."
+        ],
+        "failureModes": [
+          {
+            "scenario": "SMS provider outage",
+            "impact": "Users who rely on SMS can't sign in.",
+            "mitigation": "Encourage passkeys; allow backup codes; avoid SMS-only enrolment."
+          },
+          {
+            "scenario": "MFA fatigue (push spam)",
+            "impact": "A tired user approves an attacker's login.",
+            "mitigation": "Number matching, rate limits on prompts, or phishing-resistant passkeys instead of push."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Resource API",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["JWT middleware", "Scope / role checks"],
+        "io": {
+          "input": [{ "name": "Authorized request", "type": "HTTP + Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6…" }],
+          "output": [{ "name": "Response", "type": "200 data | 401 invalid_token | 403 insufficient_scope" }]
+        },
+        "responsibilities": [
+          "Verifies the JWT signature with the public key matching its kid header, entirely offline.",
+          "Checks iss, aud (this API), exp/nbf with small clock-skew tolerance, and required scopes.",
+          "Authorizes per resource (does this sub own this record?), not just 'is logged in'."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Accepting alg: none or the wrong algorithm",
+            "impact": "Attackers forge tokens.",
+            "mitigation": "Pin allowed algorithms (e.g. RS256) in the verifier; never read alg from the token."
+          },
+          {
+            "scenario": "Revoked user still has a valid access token",
+            "impact": "Access continues until the token expires.",
+            "mitigation": "Short token lifetimes; token introspection or a deny-list for high-risk actions."
+          }
+        ]
+      }
+    },
+    {
+      "id": "keys",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Signing Keys & JWKS",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["KMS / HSM", "/.well-known/jwks.json"],
+        "io": {
+          "input": [{ "name": "Key lookup", "type": "GET /.well-known/jwks.json (cached by kid)" }],
+          "output": [{ "name": "Public keys", "type": "JSON: { keys: [{ kid, kty: \"RSA\", alg: \"RS256\", n, e }] }" }]
+        },
+        "responsibilities": [
+          "Keeps private signing keys in KMS or an HSM; the IdP signs through the KMS API, never holding raw key material.",
+          "Publishes public keys by kid so any service can verify tokens independently.",
+          "Rotates keys on a schedule, publishing the new key before using it and keeping the old one until tokens expire."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Key rotated without overlap",
+            "impact": "Every API rejects valid tokens at once.",
+            "mitigation": "Publish the next key in JWKS days early; refetch JWKS on unknown kid (rate-limited)."
+          },
+          {
+            "scenario": "Private key compromised",
+            "impact": "Attackers mint tokens for any user.",
+            "mitigation": "HSM-backed keys, emergency rotation runbook, and short token lifetimes to limit exposure."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-browser-bff", "source": "browser", "sourceHandle": "r", "target": "bff", "targetHandle": "l", "data": { "flow": "session", "payload": "/login · /callback · /api (cookie)", "steps": [1, 4, 6], "bidirectional": true } },
+    { "id": "e-browser-idp", "source": "browser", "sourceHandle": "t", "target": "idp", "targetHandle": "l", "data": { "flow": "redirect", "payload": "302 /authorize (PKCE) ⇄ 302 ?code&state", "steps": [2, 4], "bidirectional": true } },
+    { "id": "e-idp-users", "source": "idp", "sourceHandle": "r", "target": "users", "targetHandle": "l", "data": { "flow": "idp", "payload": "verify password hash", "steps": [3], "bidirectional": true } },
+    { "id": "e-idp-mfa", "source": "idp", "sourceHandle": "t", "target": "mfa", "targetHandle": "t", "data": { "flow": "idp", "payload": "passkey / TOTP challenge", "steps": [3], "bidirectional": true } },
+    { "id": "e-bff-idp", "source": "bff", "sourceHandle": "t", "target": "idp", "targetHandle": "b", "data": { "flow": "backchannel", "payload": "POST /token ⇄ id/access/refresh tokens", "steps": [5, 7], "bidirectional": true } },
+    { "id": "e-bff-api", "source": "bff", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "api", "payload": "Bearer access_token", "steps": [6] } },
+    { "id": "e-api-keys", "source": "api", "sourceHandle": "r", "target": "keys", "targetHandle": "l", "data": { "flow": "api", "payload": "JWKS by kid (cached)", "steps": [6], "bidirectional": true } }
+  ]
+}

@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "id": "chat-messaging",
+  "title": "Chat & Messaging",
+  "summary": "A chat system keeps millions of long-lived connections open and moves each message from sender to recipient in well under a second, in order, exactly once from the user's point of view. Messages are persisted before they are acknowledged, delivered over WebSockets to online devices, and via push notifications to offline ones.",
+  "flows": {
+    "realtime": { "label": "Real-time (WebSocket)", "color": "#38bdf8" },
+    "storage": { "label": "Persistence", "color": "#a78bfa", "animated": false },
+    "offline": { "label": "Offline delivery (push)", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Send", "text": "The sender's app writes a frame on its open WebSocket: { clientMsgId, convId, body }. The clientMsgId is a UUID generated on the device, used to deduplicate retries." },
+    { "step": 2, "title": "Route", "text": "The gateway already authenticated this connection during the handshake, so it forwards the frame to the message service with the sender's identity attached." },
+    { "step": 3, "title": "Persist, then acknowledge", "text": "The message service assigns the next sequence number in the conversation, writes it durably (idempotent on clientMsgId), and only then acks the sender. This is the single tick." },
+    { "step": 4, "title": "Find the recipient", "text": "The presence registry says which gateway server holds each of the recipient's device connections, or that they are offline." },
+    { "step": 5, "title": "Deliver", "text": "Online devices get the message pushed through their gateway's socket. Offline devices get an APNs or FCM push notification and fetch the message when the app opens." },
+    { "step": 6, "title": "Receipts and sync", "text": "The recipient's app acks delivered and read, which flows back to the sender (double tick). Reconnecting clients sync everything after their last seen sequence number." }
+  ],
+  "nodes": [
+    {
+      "id": "sender",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Sender App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android / Web", "Local SQLite outbox"],
+        "io": {
+          "input": [{ "name": "Ack", "type": "WS frame: { type: \"ack\", clientMsgId, seq, serverTs }" }],
+          "output": [{ "name": "Message", "type": "WS frame: { type: \"send\", clientMsgId: uuid, convId, body, attachments[] }" }]
+        },
+        "responsibilities": [
+          "Shows the message instantly (optimistic UI) and queues it in a local outbox until acked.",
+          "Retries unacked messages with the same clientMsgId after reconnecting.",
+          "Uploads attachments directly to object storage via a pre-signed URL, sending only the reference."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Connection drops after sending, before the ack",
+            "impact": "The app doesn't know if the message was saved.",
+            "mitigation": "Resend with the same clientMsgId; the server dedupes and returns the original seq."
+          },
+          {
+            "scenario": "Flaky mobile network",
+            "impact": "Constant reconnect storms drain the battery.",
+            "mitigation": "Exponential backoff with jitter; heartbeats tuned to carrier NAT timeouts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "recipient",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Recipient App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android / Web", "Local message cache"],
+        "io": {
+          "input": [{ "name": "Message", "type": "WS frame: { type: \"message\", convId, seq, senderId, body }" }],
+          "output": [{ "name": "Receipts", "type": "WS frame: { type: \"delivered\" | \"read\", convId, upToSeq }" }]
+        },
+        "responsibilities": [
+          "Inserts incoming messages by sequence number, so display order is the server's order, not arrival order.",
+          "Detects gaps in seq and fetches the missing range.",
+          "Sends delivered and read receipts in batches (e.g. 'read up to seq 812')."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Message arrives twice (redelivery after reconnect)",
+            "impact": "Duplicate bubbles in the conversation.",
+            "mitigation": "Upsert by (convId, seq); duplicates are ignored."
+          },
+          {
+            "scenario": "Device offline for days",
+            "impact": "Thousands of messages to catch up on.",
+            "mitigation": "Paginated sync from lastSeq per conversation; recent conversations first."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "WebSocket Gateway",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Elixir / Go", "L4 load balancer", "TLS termination"],
+        "io": {
+          "input": [{ "name": "Client frames", "type": "WSS: send | delivered | read | typing | ping" }],
+          "output": [
+            { "name": "To message service", "type": "gRPC: { userId, deviceId, frame }" },
+            { "name": "To devices", "type": "WSS frames pushed to connected sockets" }
+          ]
+        },
+        "responsibilities": [
+          "Holds a very large number of idle connections per server (hundreds of thousands) and authenticates each at handshake.",
+          "Stays thin and stateless apart from its sockets; all business logic lives behind it.",
+          "Registers each connection in the presence registry and removes it on disconnect."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Gateway server restarts during a deploy",
+            "impact": "All its clients reconnect at once (thundering herd).",
+            "mitigation": "Drain gradually (close sockets over minutes); clients reconnect with jittered backoff."
+          },
+          {
+            "scenario": "Slow consumer (client on a bad network)",
+            "impact": "Outbound buffers grow until the server runs out of memory.",
+            "mitigation": "Per-connection buffer limits; drop the socket and let the client resync."
+          }
+        ]
+      }
+    },
+    {
+      "id": "chat",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "Message Service",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Kotlin / Go", "Kafka (fan-out)", "Redis pub/sub"],
+        "io": {
+          "input": [{ "name": "Send", "type": "JSON: { senderId, clientMsgId, convId, body }" }],
+          "output": [
+            { "name": "Stored message", "type": "JSON: { convId, seq, messageId, senderId, body, ts }" },
+            { "name": "Delivery", "type": "Publish to gateway:{id} channel | push job" }
+          ]
+        },
+        "responsibilities": [
+          "Checks membership (can this user post here?) and assigns a monotonically increasing seq per conversation.",
+          "Persists before acking, so an acked message is never lost.",
+          "Fans out to each member's devices; large groups go through a queue instead of inline loops."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Two servers assign seq for the same conversation",
+            "impact": "Duplicate or out-of-order sequence numbers.",
+            "mitigation": "Route each conversation to one partition owner, or use a conditional write on (convId, seq)."
+          },
+          {
+            "scenario": "Message to a 50,000-member group",
+            "impact": "Inline fan-out blocks the service for seconds.",
+            "mitigation": "Asynchronous fan-out via a queue; large channels switch to clients pulling."
+          }
+        ]
+      }
+    },
+    {
+      "id": "store",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Message Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Cassandra / ScyllaDB", "Partition key: convId"],
+        "io": {
+          "input": [{ "name": "Append", "type": "INSERT (convId, seq, messageId, senderId, body, ts) IF NOT EXISTS" }],
+          "output": [{ "name": "History", "type": "SELECT … WHERE convId = ? AND seq > ? LIMIT 100" }]
+        },
+        "responsibilities": [
+          "Stores messages partitioned by conversation and clustered by seq, so history reads are one sequential scan.",
+          "Scales writes horizontally; chat is extremely write-heavy.",
+          "Applies retention and deletion (disappearing messages, account deletion)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Very large conversation partition",
+            "impact": "Hot partition with slow reads and compaction pain.",
+            "mitigation": "Bucket the partition key by time (convId + month)."
+          },
+          {
+            "scenario": "Replica lag on read-after-write",
+            "impact": "The sender's other device doesn't see the message it just sent.",
+            "mitigation": "Use QUORUM consistency for both writes and reads of recent history."
+          }
+        ]
+      }
+    },
+    {
+      "id": "presence",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Presence & Session Registry",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Redis Cluster", "TTL heartbeats"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "GET sessions:{userId} → set of { deviceId, gatewayId }" }],
+          "output": [{ "name": "Routes", "type": "JSON: [{ deviceId, gatewayId }] | [] (offline)" }]
+        },
+        "responsibilities": [
+          "Maps every online device to the gateway server holding its socket.",
+          "Expires entries via TTL when heartbeats stop, so crashed gateways don't leave ghosts.",
+          "Powers 'online' and 'last seen' indicators, with updates throttled to avoid fan-out storms."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Registry unavailable",
+            "impact": "Online routing breaks.",
+            "mitigation": "Fall back to broadcasting to all gateways for small groups, plus push for everyone; messages are still stored."
+          },
+          {
+            "scenario": "Stale entry points to a dead gateway",
+            "impact": "Messages are sent into the void.",
+            "mitigation": "Short TTLs, and recipients sync from lastSeq on reconnect, so nothing is lost permanently."
+          }
+        ]
+      }
+    },
+    {
+      "id": "push",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Push Notifications",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["APNs (Apple)", "FCM (Google)"],
+        "io": {
+          "input": [{ "name": "Push job", "type": "JSON: { deviceTokens[], title, preview, convId, collapseKey }" }],
+          "output": [{ "name": "OS notification", "type": "Platform push → device wakes and syncs" }]
+        },
+        "responsibilities": [
+          "Wakes offline devices; the app then fetches the actual messages over its own connection.",
+          "Collapses multiple notifications per conversation and respects mute settings.",
+          "Removes invalid device tokens reported back by Apple and Google."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Push delayed or dropped by the platform",
+            "impact": "Users see messages late.",
+            "mitigation": "Push is only a wake-up hint; correctness comes from sync on app open."
+          },
+          {
+            "scenario": "Message content in push payloads",
+            "impact": "Breaks end-to-end encryption guarantees.",
+            "mitigation": "Send encrypted or contentless pushes; the app decrypts locally."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-sender-gateway", "source": "sender", "sourceHandle": "r", "target": "gateway", "targetHandle": "t", "data": { "flow": "realtime", "payload": "send ⇄ ack { seq }", "steps": [1, 3], "bidirectional": true } },
+    { "id": "e-gateway-chat", "source": "gateway", "sourceHandle": "r", "target": "chat", "targetHandle": "l", "data": { "flow": "realtime", "payload": "route ⇄ deliver", "steps": [2, 5], "bidirectional": true } },
+    { "id": "e-chat-store", "source": "chat", "sourceHandle": "t", "target": "store", "targetHandle": "l", "data": { "flow": "storage", "payload": "append (convId, seq)", "steps": [3], "bidirectional": true } },
+    { "id": "e-chat-presence", "source": "chat", "sourceHandle": "b", "target": "presence", "targetHandle": "l", "data": { "flow": "realtime", "payload": "where is user B?", "steps": [4], "bidirectional": true } },
+    { "id": "e-gateway-recipient", "source": "gateway", "sourceHandle": "b", "target": "recipient", "targetHandle": "r", "data": { "flow": "realtime", "payload": "message ⇄ delivered / read", "steps": [5, 6], "bidirectional": true } },
+    { "id": "e-chat-push", "source": "chat", "sourceHandle": "r", "target": "push", "targetHandle": "l", "data": { "flow": "offline", "payload": "notify offline devices", "steps": [5] } }
+  ]
+}
