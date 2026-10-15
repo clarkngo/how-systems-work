@@ -1,0 +1,297 @@
+{
+  "schemaVersion": 1,
+  "id": "ecommerce-checkout",
+  "title": "E-Commerce Checkout",
+  "summary": "Checkout turns a cart into a paid order without overselling stock or charging twice. The server reprices everything, holds inventory for a few minutes, lets the payment provider collect the card, and only creates the order when the provider confirms payment via webhook.",
+  "flows": {
+    "sync": { "label": "Synchronous checkout calls", "color": "#38bdf8" },
+    "payment": { "label": "Payment (card data never touches our servers)", "color": "#f472b6" },
+    "events": { "label": "Async order events", "color": "#a78bfa" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Submit checkout", "text": "The storefront POSTs the cart ID and shipping address with an Idempotency-Key, so a double-click or network retry can't create two checkouts." },
+    { "step": 2, "title": "Reprice on the server", "text": "Prices, promotions, shipping, and tax are recomputed server-side. Totals sent by the client are never trusted." },
+    { "step": 3, "title": "Hold the stock", "text": "Inventory places a reservation with a TTL (e.g. 15 minutes). Stock is held, not yet decremented, so abandoned checkouts release it automatically." },
+    { "step": 4, "title": "Authorize payment", "text": "The checkout service creates a PaymentIntent and returns its client_secret. The browser confirms the card inside the provider's iframe, including any 3-D Secure challenge." },
+    { "step": 5, "title": "Webhook confirms", "text": "The provider calls the order service's webhook. The order is created idempotently, keyed on the PaymentIntent ID, and the reservation is committed." },
+    { "step": 6, "title": "Fulfil and notify", "text": "OrderPlaced is published through a transactional outbox to fulfilment and notifications. Payment is captured when the order ships." }
+  ],
+  "nodes": [
+    {
+      "id": "storefront",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Storefront Checkout UI",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Next.js", "Stripe Elements / Adyen Drop-in"],
+        "io": {
+          "input": [{ "name": "Checkout session", "type": "JSON: { checkoutId, totals, client_secret }" }],
+          "output": [
+            { "name": "Checkout request", "type": "JSON: { cartId, shippingAddress, email } + Idempotency-Key" },
+            { "name": "Card confirmation", "type": "Provider iframe: card details → confirmPayment(client_secret)" }
+          ]
+        },
+        "responsibilities": [
+          "Collects address and contact details; displays server-computed totals, never its own.",
+          "Hosts the provider's card iframe so card numbers never reach our servers (keeps PCI scope minimal).",
+          "Disables the pay button and reuses one Idempotency-Key per checkout attempt."
+        ],
+        "failureModes": [
+          {
+            "scenario": "User double-clicks Pay or the request is retried",
+            "impact": "Two checkouts and possibly two charges.",
+            "mitigation": "Idempotency-Key stored server-side; the same key returns the original result."
+          },
+          {
+            "scenario": "Tab closed during the 3-D Secure challenge",
+            "impact": "Payment may succeed while the UI never sees the result.",
+            "mitigation": "Order creation is driven by the webhook, not the browser redirect; email confirms the order."
+          }
+        ]
+      }
+    },
+    {
+      "id": "checkout",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Checkout Orchestrator",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Go / Java service", "Postgres (idempotency keys)", "Temporal (sagas)"],
+        "io": {
+          "input": [{ "name": "Checkout request", "type": "HTTP POST /checkout { cartId, address } + Idempotency-Key" }],
+          "output": [
+            { "name": "To pricing", "type": "JSON: { lines[], address, promoCodes[] }" },
+            { "name": "To inventory", "type": "JSON: { checkoutId, items: [{ sku, qty }], ttl: 900 }" },
+            { "name": "To payment", "type": "JSON: { amount, currency, metadata: { checkoutId } }" }
+          ]
+        },
+        "responsibilities": [
+          "Runs checkout as a saga: reprice, reserve, authorize; each step has a compensating action (release hold, cancel intent).",
+          "Stores the idempotency key with the response, so retries replay the outcome instead of re-executing.",
+          "Applies per-step timeouts and gives the user a clear failure state rather than a spinner."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Crash between reserving stock and creating the payment",
+            "impact": "Stock held for nobody; checkout stuck half-done.",
+            "mitigation": "Durable saga state; reservations expire via TTL even if compensation never runs."
+          },
+          {
+            "scenario": "Price changed after the user saw the total",
+            "impact": "User is charged a different amount than shown.",
+            "mitigation": "Return a priceVersion; if the reprice differs, stop and show the new total for re-confirmation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pricing",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Cart, Pricing & Tax",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Promotion engine", "Avalara / TaxJar", "Redis cart cache"],
+        "io": {
+          "input": [{ "name": "Cart to price", "type": "JSON: { lines: [{ sku, qty }], address, promoCodes[] }" }],
+          "output": [{ "name": "Priced cart", "type": "JSON: { lines[], discounts[], shipping, tax, total, currency, priceVersion }" }]
+        },
+        "responsibilities": [
+          "Resolves current list prices and applies promotions in a defined, deterministic order.",
+          "Calculates shipping and destination-based tax for the shipping address.",
+          "Returns all amounts as integers in minor units (cents), so there are no floating-point rounding bugs."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Tax provider timeout",
+            "impact": "Checkout blocks, or tax is wrong and becomes a liability.",
+            "mitigation": "Short timeout, then a cached rate table for the region, flagged for later reconciliation."
+          },
+          {
+            "scenario": "Promotions stack unexpectedly",
+            "impact": "Negative or near-zero totals; coupon abuse spreads quickly.",
+            "mitigation": "Explicit stacking rules, a floor on total, and per-code usage limits enforced atomically."
+          }
+        ]
+      }
+    },
+    {
+      "id": "inventory",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Inventory Reservations",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres (row locks)", "Redis (hot SKUs)"],
+        "io": {
+          "input": [{ "name": "Reserve", "type": "JSON: { checkoutId, items: [{ sku, qty }], ttl }" }],
+          "output": [{ "name": "Reservation", "type": "JSON: { reservationId, expiresAt } | 409 { sku, available }" }]
+        },
+        "responsibilities": [
+          "Atomically checks available = onHand - reserved and records a hold, so two buyers can't get the last unit.",
+          "Expires holds after the TTL so abandoned carts return stock automatically.",
+          "Commits (decrements on-hand) only when the order is confirmed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Flash sale on one SKU",
+            "impact": "Row-lock contention makes every checkout slow or time out.",
+            "mitigation": "Split stock into sub-counters (bucketed rows) or an atomic Redis counter for hot SKUs."
+          },
+          {
+            "scenario": "Check-then-write race",
+            "impact": "Overselling: more units sold than exist.",
+            "mitigation": "Single conditional UPDATE … WHERE available >= qty, never a separate SELECT then UPDATE."
+          }
+        ]
+      }
+    },
+    {
+      "id": "payment",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Payment Provider",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Stripe", "Adyen", "Braintree"],
+        "io": {
+          "input": [
+            { "name": "Create intent", "type": "POST /payment_intents { amount, currency, capture_method: \"manual\" }" },
+            { "name": "Confirm", "type": "From browser iframe: card + 3-D Secure" }
+          ],
+          "output": [{ "name": "Webhook", "type": "POST /webhooks { type: \"payment_intent.succeeded\", id, data } + signature" }]
+        },
+        "responsibilities": [
+          "Collects and tokenizes card data, runs 3-D Secure, and authorizes with the card network.",
+          "Holds funds (authorization) until capture, which is triggered at shipment.",
+          "Reports the final outcome via signed webhooks, retried until acknowledged."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Webhook arrives twice or out of order",
+            "impact": "Duplicate orders or a 'failed' event overwriting a success.",
+            "mitigation": "Dedupe on event ID; fetch the latest intent status from the API instead of trusting event order."
+          },
+          {
+            "scenario": "Authorization expires before capture (about 7 days)",
+            "impact": "Capture fails on a backordered item; goods shipped unpaid.",
+            "mitigation": "Re-authorize, or capture at order time for items that may ship late."
+          }
+        ]
+      }
+    },
+    {
+      "id": "orders",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Order Service",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres", "Transactional outbox", "Debezium / outbox relay"],
+        "io": {
+          "input": [{ "name": "Payment webhook", "type": "Signed event: payment_intent.succeeded { id, metadata.checkoutId }" }],
+          "output": [{ "name": "OrderPlaced", "type": "Event: { orderId, items[], total, customer, shippingAddress }" }]
+        },
+        "responsibilities": [
+          "Verifies the webhook signature, then creates the order with a unique constraint on paymentIntentId.",
+          "Writes the order and an OrderPlaced outbox row in one database transaction.",
+          "Commits the inventory reservation, and owns the order's lifecycle (placed, shipped, refunded)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Order saved but event publish fails (dual write)",
+            "impact": "The customer is charged but the order never reaches the warehouse.",
+            "mitigation": "Transactional outbox: a relay publishes committed outbox rows, at least once."
+          },
+          {
+            "scenario": "Webhook endpoint down",
+            "impact": "Paid checkouts with no orders pile up.",
+            "mitigation": "The provider retries for days; a reconciler also lists recent succeeded intents with no order."
+          }
+        ]
+      }
+    },
+    {
+      "id": "fulfillment",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 0 },
+      "data": {
+        "label": "Fulfilment & Shipping",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["WMS integration", "ShipStation / EasyPost"],
+        "io": {
+          "input": [{ "name": "OrderPlaced", "type": "Event: { orderId, items[], shippingAddress }" }],
+          "output": [{ "name": "Shipment", "type": "Event: OrderShipped { orderId, carrier, trackingNumber } → triggers capture" }]
+        },
+        "responsibilities": [
+          "Routes the order to a warehouse that has the stock, and generates pick lists and labels.",
+          "Emits OrderShipped, which triggers payment capture and the shipping email.",
+          "Handles partial shipments and backorders as separate shipments."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Event consumed twice",
+            "impact": "The order is shipped twice.",
+            "mitigation": "Idempotent consumer: a processed-event table keyed on event ID."
+          },
+          {
+            "scenario": "Warehouse system offline",
+            "impact": "Orders queue up and delivery promises are missed.",
+            "mitigation": "Queue durably, alert on order age, re-route to an alternate warehouse."
+          }
+        ]
+      }
+    },
+    {
+      "id": "notifications",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 480 },
+      "data": {
+        "label": "Customer Notifications",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["SendGrid / SES", "Twilio SMS"],
+        "io": {
+          "input": [{ "name": "Order events", "type": "Event: OrderPlaced | OrderShipped | OrderRefunded" }],
+          "output": [{ "name": "Messages", "type": "Email / SMS: confirmation, tracking link, receipt" }]
+        },
+        "responsibilities": [
+          "Sends the order confirmation and receipt, rendered from the order record rather than from the checkout session.",
+          "Sends shipping updates with tracking links.",
+          "Respects customer channel preferences and suppression lists."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Email provider outage",
+            "impact": "Customers think the order failed and buy again.",
+            "mitigation": "Queue and retry; the order status page is the source of truth, not the email."
+          },
+          {
+            "scenario": "Duplicate events",
+            "impact": "Customers receive two confirmation emails.",
+            "mitigation": "Dedupe on (orderId, template) before sending."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-ui-checkout", "source": "storefront", "sourceHandle": "r", "target": "checkout", "targetHandle": "l", "data": { "flow": "sync", "payload": "POST /checkout + Idempotency-Key", "steps": [1], "bidirectional": true } },
+    { "id": "e-checkout-pricing", "source": "checkout", "sourceHandle": "t", "target": "pricing", "targetHandle": "l", "data": { "flow": "sync", "payload": "reprice(cart, address)", "steps": [2], "bidirectional": true } },
+    { "id": "e-checkout-inventory", "source": "checkout", "sourceHandle": "b", "target": "inventory", "targetHandle": "l", "data": { "flow": "sync", "payload": "reserve(items, ttl=15m)", "steps": [3] } },
+    { "id": "e-checkout-payment", "source": "checkout", "sourceHandle": "r", "target": "payment", "targetHandle": "l", "data": { "flow": "payment", "payload": "create PaymentIntent ⇄ client_secret", "steps": [4], "bidirectional": true } },
+    { "id": "e-ui-payment", "source": "storefront", "sourceHandle": "t", "target": "payment", "targetHandle": "t", "data": { "flow": "payment", "payload": "confirm card in iframe + 3-D Secure", "steps": [4] } },
+    { "id": "e-payment-orders", "source": "payment", "sourceHandle": "r", "target": "orders", "targetHandle": "l", "data": { "flow": "payment", "payload": "webhook: payment_intent.succeeded", "steps": [5] } },
+    { "id": "e-orders-fulfillment", "source": "orders", "sourceHandle": "t", "target": "fulfillment", "targetHandle": "l", "data": { "flow": "events", "payload": "OrderPlaced (outbox)", "steps": [6] } },
+    { "id": "e-orders-notifications", "source": "orders", "sourceHandle": "b", "target": "notifications", "targetHandle": "l", "data": { "flow": "events", "payload": "OrderPlaced (outbox)", "steps": [6] } }
+  ]
+}

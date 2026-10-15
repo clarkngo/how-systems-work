@@ -1,0 +1,293 @@
+{
+  "schemaVersion": 1,
+  "id": "url-shortener",
+  "title": "URL Shortener",
+  "summary": "A URL shortener maps a short code to a long URL. Writes are rare, while reads can be 100 times more frequent and must be very fast. Codes come from a collision-free ID generator, redirects are served from cache, and click analytics are recorded asynchronously so counting never slows a redirect down.",
+  "flows": {
+    "write": { "label": "Create link (write path)", "color": "#fbbf24" },
+    "read": { "label": "Redirect (hot read path)", "color": "#38bdf8" },
+    "async": { "label": "Click analytics (async)", "color": "#a78bfa" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Create a link", "text": "POST /links { longUrl } passes the edge (auth, rate limits) to the write API, which validates the URL and checks it against malware and phishing lists." },
+    { "step": 2, "title": "Allocate an ID", "text": "The write API takes the next number from a block of IDs it leased earlier and base62-encodes it. Seven characters give 62^7 ≈ 3.5 trillion codes, with no collisions to check." },
+    { "step": 3, "title": "Store the mapping", "text": "code → { longUrl, ownerId, expiresAt } is written with a conditional put, so an existing code can never be overwritten." },
+    { "step": 4, "title": "Someone clicks", "text": "GET /abc1234 reaches the nearest edge location. If the CDN has the redirect cached, it answers right there." },
+    { "step": 5, "title": "Look up the code", "text": "The redirect service reads from Redis; on a miss it reads the database and fills the cache. Unknown codes are cached too, briefly, to stop scans from hammering the database." },
+    { "step": 6, "title": "Redirect and count", "text": "The service returns 302 Location: longUrl and emits a click event without waiting for it. 301 is cacheable by browsers but hides repeat clicks from analytics." }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Browser / API Client",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Web app", "REST API clients"],
+        "io": {
+          "input": [{ "name": "Responses", "type": "201 { shortUrl } | 302 Location: https://long.example/…" }],
+          "output": [{ "name": "Requests", "type": "POST /links { longUrl, customAlias? } | GET /{code}" }]
+        },
+        "responsibilities": [
+          "Creates links through the app or API with an API key.",
+          "Follows redirects; browsers cache 301s indefinitely, 302s not at all.",
+          "Shares short links in places with tight character limits (SMS, print, QR codes)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Link scraper or scanner enumerates codes",
+            "impact": "Private links are discovered; heavy read load.",
+            "mitigation": "Non-sequential codes for private links (random or shuffled IDs); per-IP rate limits."
+          },
+          {
+            "scenario": "Wrong 301 published and cached by browsers",
+            "impact": "Users keep going to the old destination even after it's fixed.",
+            "mitigation": "Use 302 for editable links; reserve 301 for permanent ones."
+          }
+        ]
+      }
+    },
+    {
+      "id": "edge",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Edge / CDN & Rate Limiter",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Cloudflare / CloudFront", "Edge KV"],
+        "io": {
+          "input": [{ "name": "All traffic", "type": "HTTPS: POST /links | GET /{code}" }],
+          "output": [
+            { "name": "Writes", "type": "→ write API (authenticated, rate-limited)" },
+            { "name": "Reads", "type": "→ cached 302 | → redirect service on miss" }
+          ]
+        },
+        "responsibilities": [
+          "Terminates TLS close to users and caches redirects for popular codes for seconds to minutes.",
+          "Rate-limits link creation per API key and IP to deter spam and abuse.",
+          "Absorbs viral spikes, such as one link in a Super Bowl ad, before they reach origin."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Edge serves a cached redirect after the link was disabled for abuse",
+            "impact": "Malicious destination stays live.",
+            "mitigation": "Purge API call on takedown; short edge TTLs for redirects."
+          },
+          {
+            "scenario": "Cache stampede when a hot key expires",
+            "impact": "Thousands of simultaneous misses hit origin.",
+            "mitigation": "Request coalescing and stale-while-revalidate at the edge."
+          }
+        ]
+      }
+    },
+    {
+      "id": "write",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Link Write API",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Go / Node service", "Safe Browsing API"],
+        "io": {
+          "input": [{ "name": "Create", "type": "JSON: { longUrl, customAlias?, expiresAt? } + API key" }],
+          "output": [{ "name": "Mapping", "type": "JSON: { code: \"abc1234\", longUrl, ownerId, createdAt, expiresAt }" }]
+        },
+        "responsibilities": [
+          "Validates and normalizes URLs; rejects known-malicious destinations.",
+          "Base62-encodes an ID from its leased block (or checks a custom alias is free).",
+          "Optionally dedupes: the same owner and URL return the existing code."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Spammers create links to phishing sites",
+            "impact": "The domain is blocklisted by browsers and email providers, breaking every customer's links.",
+            "mitigation": "Scan on create and re-scan periodically; fast takedown; trust tiers for new accounts."
+          },
+          {
+            "scenario": "Custom alias race (two users claim 'sale')",
+            "impact": "One user overwrites the other's link.",
+            "mitigation": "Conditional insert (put-if-absent); the loser gets a 409."
+          }
+        ]
+      }
+    },
+    {
+      "id": "idgen",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "ID Generator",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Range leasing (ZooKeeper / DB counter)", "Snowflake IDs"],
+        "io": {
+          "input": [{ "name": "Lease", "type": "JSON: { workerId, blockSize: 1000 }" }],
+          "output": [{ "name": "ID block", "type": "JSON: { start: 9800000, end: 9800999 }" }]
+        },
+        "responsibilities": [
+          "Hands out disjoint ID ranges so each writer can mint codes locally without coordination.",
+          "Guarantees uniqueness without the database checks that random codes need.",
+          "Optionally scrambles IDs (e.g. a reversible bit permutation) so codes aren't guessable in sequence."
+        ],
+        "failureModes": [
+          {
+            "scenario": "ID service down",
+            "impact": "No new links once writers exhaust their current blocks.",
+            "mitigation": "Writers lease the next block early; larger blocks buy more time."
+          },
+          {
+            "scenario": "Writer crashes mid-block",
+            "impact": "Unused IDs are lost.",
+            "mitigation": "Harmless: gaps are fine, and the ID space is effectively unlimited."
+          }
+        ]
+      }
+    },
+    {
+      "id": "redirect",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Redirect Service",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Stateless service (many replicas)", "Async event emitter"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "GET /{code} + { ip, userAgent, referer }" }],
+          "output": [
+            { "name": "Redirect", "type": "HTTP 302 Location: longUrl | 404 | 410 (expired)" },
+            { "name": "Click event", "type": "Event: { code, ts, country, device, referer } (fire-and-forget)" }
+          ]
+        },
+        "responsibilities": [
+          "Resolves code → URL with a p99 target in single-digit milliseconds.",
+          "Handles expired and disabled links with clear 410 and 451 responses.",
+          "Emits click events to a local buffer and never waits on analytics."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Analytics pipeline slow",
+            "impact": "If emitted synchronously, every redirect slows down too.",
+            "mitigation": "Bounded in-memory buffer; drop or sample events under pressure, never block the redirect."
+          },
+          {
+            "scenario": "Open redirect abuse",
+            "impact": "Attackers use your trusted domain to launder phishing URLs.",
+            "mitigation": "Destination scanning, interstitial warnings for flagged links, abuse reporting."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cache",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Redirect Cache",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Redis / Memcached", "LRU eviction"],
+        "io": {
+          "input": [{ "name": "Get", "type": "GET url:{code}" }],
+          "output": [{ "name": "Value", "type": "longUrl | \"__NOT_FOUND__\" (negative cache, 60s) | miss" }]
+        },
+        "responsibilities": [
+          "Keeps the hot set of codes in memory; clicks follow a power law, so a small cache serves most traffic.",
+          "Read-through: on a miss, load from the database and populate with a TTL.",
+          "Negative-caches unknown codes to absorb enumeration and typo traffic."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cache cluster lost",
+            "impact": "The full read load hits the database, which may fall over.",
+            "mitigation": "Database sized for cold-cache load, or warm the cache from recent click logs on startup."
+          },
+          {
+            "scenario": "Link edited but cache still holds the old URL",
+            "impact": "Visitors go to the old destination until the TTL expires.",
+            "mitigation": "Delete the cache key (and purge the edge) as part of every update."
+          }
+        ]
+      }
+    },
+    {
+      "id": "db",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Link Database",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["DynamoDB / Cassandra", "Key: code"],
+        "io": {
+          "input": [{ "name": "Put", "type": "PutItem code → { longUrl, ownerId, expiresAt } (attribute_not_exists)" }],
+          "output": [{ "name": "Get", "type": "GetItem(code) → { longUrl, expiresAt, disabled }" }]
+        },
+        "responsibilities": [
+          "Stores billions of small records with single-key lookups only, which is a perfect fit for a key-value store.",
+          "Replicates across regions so redirects survive a regional outage.",
+          "Expires links automatically via TTL attributes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Regional outage",
+            "impact": "Links created only in that region are unresolvable.",
+            "mitigation": "Multi-region replication (global tables); redirects read the local replica."
+          },
+          {
+            "scenario": "Hot partition from one viral code",
+            "impact": "Throttling on that key.",
+            "mitigation": "The cache and edge absorb it; the database should rarely see repeat reads for one code."
+          }
+        ]
+      }
+    },
+    {
+      "id": "analytics",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 480 },
+      "data": {
+        "label": "Click Analytics",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka", "ClickHouse"],
+        "io": {
+          "input": [{ "name": "Click events", "type": "Event: { code, ts, country, device, referer }" }],
+          "output": [{ "name": "Stats", "type": "SQL: clicks by code × day × country × referer" }]
+        },
+        "responsibilities": [
+          "Ingests click events in batches and aggregates them into per-link dashboards.",
+          "Filters bots and link-preview crawlers (Slack, Twitter unfurls) from human clicks.",
+          "Provides approximate unique counts (HyperLogLog) cheaply at scale."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ingestion falls behind",
+            "impact": "Dashboards are stale; redirects are unaffected.",
+            "mitigation": "Buffered in Kafka; show a 'data delayed' banner instead of wrong numbers."
+          },
+          {
+            "scenario": "Link unfurlers inflate counts",
+            "impact": "Customers see clicks that no human made.",
+            "mitigation": "User-agent and behaviour filtering; label preview fetches separately."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-edge", "source": "client", "sourceHandle": "r", "target": "edge", "targetHandle": "l", "data": { "flow": "read", "payload": "POST /links · GET /{code} ⇄ 302", "steps": [1, 4, 6], "bidirectional": true } },
+    { "id": "e-edge-write", "source": "edge", "sourceHandle": "t", "target": "write", "targetHandle": "l", "data": { "flow": "write", "payload": "create link", "steps": [1], "bidirectional": true } },
+    { "id": "e-write-idgen", "source": "write", "sourceHandle": "r", "target": "idgen", "targetHandle": "l", "data": { "flow": "write", "payload": "lease ID block", "steps": [2], "bidirectional": true } },
+    { "id": "e-write-db", "source": "write", "sourceHandle": "t", "target": "db", "targetHandle": "t", "data": { "flow": "write", "payload": "put-if-absent code → URL", "steps": [3] } },
+    { "id": "e-edge-redirect", "source": "edge", "sourceHandle": "b", "target": "redirect", "targetHandle": "l", "data": { "flow": "read", "payload": "GET /{code} (edge miss)", "steps": [4, 6], "bidirectional": true } },
+    { "id": "e-redirect-cache", "source": "redirect", "sourceHandle": "r", "target": "cache", "targetHandle": "l", "data": { "flow": "read", "payload": "GET url:{code}", "steps": [5], "bidirectional": true } },
+    { "id": "e-cache-db", "source": "cache", "sourceHandle": "r", "target": "db", "targetHandle": "b", "data": { "flow": "read", "payload": "miss → read-through", "steps": [5], "bidirectional": true } },
+    { "id": "e-redirect-analytics", "source": "redirect", "sourceHandle": "b", "target": "analytics", "targetHandle": "b", "data": { "flow": "async", "payload": "click event (fire-and-forget)", "steps": [6] } }
+  ]
+}
