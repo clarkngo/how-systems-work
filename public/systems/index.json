@@ -32,7 +32,7 @@
     { "id": "clickstream-analytics", "title": "Real-Time Analytics", "category": "Data & Analytics", "file": null, "description": "Stream processing, windowed aggregations, and OLAP dashboards." },
     { "id": "data-lakehouse", "title": "Data Lakehouse", "category": "Data & Analytics", "file": null, "description": "Object storage, table formats (Iceberg), catalogs, and query engines." },
     { "id": "cdc-replication", "title": "Database Change Data Capture", "category": "Data & Analytics", "file": null, "description": "Reading the write-ahead log to replicate changes to other systems." },
-    { "id": "ab-testing", "title": "A/B Testing Platform", "category": "Data & Analytics", "file": null, "description": "Assignment, exposure logging, metrics pipelines, and statistical analysis." },
+    { "id": "ab-testing", "title": "A/B Testing Platform", "category": "Data & Analytics", "file": "ab-testing.json", "description": "Assignment, exposure logging, metrics pipelines, and statistical analysis." },
 
     { "id": "chat-messaging", "title": "Chat & Messaging", "category": "Social & Media", "file": "chat-messaging.json", "description": "Persistent connections, message fan-out, delivery receipts, and presence." },
     { "id": "news-feed", "title": "Social News Feed", "category": "Social & Media", "file": null, "description": "Fan-out on write vs read, ranking, and timeline caching." },

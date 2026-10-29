@@ -1,0 +1,309 @@
+{
+  "schemaVersion": 1,
+  "id": "ab-testing",
+  "title": "A/B Testing Platform",
+  "summary": "An experimentation platform answers 'did this change cause a difference?' It randomly and consistently assigns users to variants, records exactly who saw what, joins that to what they did afterwards, and runs statistics that hold up even when people check results early. Most real failures are not bad statistics but bad data: broken randomization, missing exposures, or peeking.",
+  "flows": {
+    "setup": { "label": "Experiment config", "color": "#fbbf24" },
+    "realtime": { "label": "Assignment & events (in-app)", "color": "#38bdf8" },
+    "pipeline": { "label": "Metrics pipeline (batch)", "color": "#a78bfa", "animated": false },
+    "decision": { "label": "Results & decisions", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Design the experiment", "text": "A PM defines the hypothesis, the variants (50/50), targeting, one primary metric (checkout conversion), and guardrails (latency, revenue per user, crash rate). A power calculation turns the minimum detectable effect into a sample size and duration, in whole weeks." },
+    { "step": 2, "title": "Publish the config", "text": "The config service versions the experiment and pushes the ruleset to every SDK through a CDN-hosted JSON file plus a streaming channel for fast updates." },
+    { "step": 3, "title": "Assign locally", "text": "The SDK computes hash(userId + experiment salt) mod 10,000 to pick a bucket. No network call is needed, and the same user always lands in the same variant on every device they log in from." },
+    { "step": 4, "title": "Log the exposure", "text": "Only when the user actually reaches the changed screen does the SDK emit an exposure event { userId, experiment, variant, ts }, alongside the app's normal product events." },
+    { "step": 5, "title": "Land the events", "text": "The collector validates and deduplicates events and streams them into exposure and event tables in the warehouse." },
+    { "step": 6, "title": "Compute metrics", "text": "A daily pipeline joins each exposed user to their events after their first exposure, computes per-user metric values, and reduces them to per-variant sums. CUPED uses each user's pre-experiment behaviour to cut variance." },
+    { "step": 7, "title": "Run the statistics", "text": "First a sample-ratio-mismatch check; if the 50/50 split is off, the results are not trusted. Then lift, confidence intervals, and sequential p-values that stay valid under daily peeking. A guardrail breach stops the experiment automatically." },
+    { "step": 8, "title": "Decide", "text": "The team ships, iterates, or kills the change. Shipping means rolling the winning variant to 100% and then deleting the flag from the code." }
+  ],
+  "nodes": [
+    {
+      "id": "console",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Experiment Console",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Internal web app", "Power calculator"],
+        "io": {
+          "input": [{ "name": "Decisions", "type": "Human: ship | iterate | kill, based on results" }],
+          "output": [{ "name": "Experiment definition", "type": "JSON: { key, hypothesis, variants: [{ name, weight }], targeting, primaryMetric, guardrails[], mde, durationDays }" }]
+        },
+        "responsibilities": [
+          "Forces a written hypothesis and one pre-registered primary metric before launch.",
+          "Calculates sample size from baseline rate, minimum detectable effect, significance level, and power.",
+          "Checks for conflicts: overlapping experiments on the same surface use mutually exclusive layers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Metric chosen after seeing the results",
+            "impact": "With 20 metrics, about one will be 'significant' by chance at p < 0.05.",
+            "mitigation": "Lock the primary metric at launch; correct secondary metrics for multiple comparisons."
+          },
+          {
+            "scenario": "Underpowered test",
+            "impact": "A real 2% improvement reads as 'no effect', and good ideas are discarded.",
+            "mitigation": "Block launch if the planned duration can't reach the required sample size."
+          }
+        ]
+      }
+    },
+    {
+      "id": "config",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Experiment Config Service",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Postgres (versioned configs)", "CDN JSON", "SSE / streaming updates"],
+        "io": {
+          "input": [
+            { "name": "Definitions", "type": "JSON: experiment definition + version" },
+            { "name": "Auto-stop", "type": "JSON: { experimentKey, action: \"stop\", reason }" }
+          ],
+          "output": [{ "name": "Ruleset", "type": "JSON: { version, experiments: [{ key, salt, layer, allocation: [{ variant, range: [0, 5000] }], targeting }] }" }]
+        },
+        "responsibilities": [
+          "Stores each experiment's full history of versions, so analysis knows exactly what ran when.",
+          "Compiles experiments into a compact ruleset served from a CDN; SDKs never call it per request.",
+          "Acts as the kill switch: stopping an experiment sends every user back to control within seconds."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Config service or CDN unreachable",
+            "impact": "SDKs can't fetch new rulesets.",
+            "mitigation": "SDKs keep the last good ruleset and fall back to control; experiments degrade, the app does not."
+          },
+          {
+            "scenario": "Allocation changed mid-experiment (10% → 50%)",
+            "impact": "Early users are over-represented in one arm, and comparisons become biased (Simpson's paradox).",
+            "mitigation": "Ramping restarts the analysis window, or analysis only uses data from after the final allocation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sdk",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "App + Assignment SDK",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Server & client SDKs", "MurmurHash3", "Local event buffer"],
+        "io": {
+          "input": [{ "name": "Ruleset", "type": "Cached JSON ruleset" }],
+          "output": [
+            { "name": "Variant", "type": "getVariant(\"checkout_v2\", user) → \"treatment\" (in-process, <1ms)" },
+            { "name": "Exposure event", "type": "JSON: { type: \"exposure\", userId, experiment, variant, rulesetVersion, ts }" }
+          ]
+        },
+        "responsibilities": [
+          "Assigns deterministically: bucket = hash(salt + userId) mod 10000, then looks up the bucket's variant.",
+          "Logs an exposure only when the variant actually changes what the user sees, not when it's merely evaluated.",
+          "Never throws: any error returns the control variant so experiments can't break the product."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Exposure logged on assignment rather than when seen",
+            "impact": "Users who never reached the page dilute both arms, shrinking the measured effect towards zero.",
+            "mitigation": "Call logExposure() at the render point; keep evaluation and exposure as separate APIs."
+          },
+          {
+            "scenario": "Client-side assignment after the page renders",
+            "impact": "Users see the control flash into the treatment, which itself changes behaviour.",
+            "mitigation": "Assign on the server or at the edge, or bootstrap the ruleset into the initial HTML."
+          },
+          {
+            "scenario": "Same salt reused for a new experiment",
+            "impact": "The same users land in treatment again; leftover effects from the old test contaminate the new one.",
+            "mitigation": "A fresh random salt per experiment, generated by the config service."
+          }
+        ]
+      }
+    },
+    {
+      "id": "collector",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Event Collector",
+        "layer": "gateway",
+        "criticality": "degradable",
+        "tech": ["HTTP ingest", "Kafka", "Bot filtering"],
+        "io": {
+          "input": [{ "name": "Event batches", "type": "HTTP POST /events { events: [exposure | track] }" }],
+          "output": [{ "name": "Validated events", "type": "Kafka topics: exposures, events (deduped by eventId)" }]
+        },
+        "responsibilities": [
+          "Validates event schemas and deduplicates retries by eventId.",
+          "Filters known bots and internal test traffic, which would otherwise distort metrics.",
+          "Stamps a server receive time and preserves the ruleset version on each exposure."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Treatment variant sends events that the collector drops (e.g. a new event name fails validation)",
+            "impact": "Treatment looks worse purely because its data is missing.",
+            "mitigation": "Alert on per-variant event-volume differences; a sample-ratio-mismatch check catches dropped exposures."
+          },
+          {
+            "scenario": "Ad blockers block the event endpoint",
+            "impact": "Some users are invisible; if blocking correlates with variant, results are biased.",
+            "mitigation": "Proxy the collector through a first-party domain; log business-critical events server-side."
+          }
+        ]
+      }
+    },
+    {
+      "id": "warehouse",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Event Warehouse",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["BigQuery / Snowflake", "Partitioned by date"],
+        "io": {
+          "input": [{ "name": "Event stream", "type": "Streaming inserts: exposures, events" }],
+          "output": [{ "name": "Tables", "type": "SQL: exposures(user_id, experiment, variant, first_ts), events(user_id, name, value, ts)" }]
+        },
+        "responsibilities": [
+          "Stores raw exposures and product events as immutable, date-partitioned tables.",
+          "Holds pre-experiment history per user, which CUPED needs for variance reduction.",
+          "Is the single source of truth, so experiment metrics match company dashboards."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Late or missing partitions",
+            "impact": "A day is under-counted, and the analysis treats that as a real effect.",
+            "mitigation": "Data-completeness checks gate the metrics run; delayed days are marked provisional."
+          },
+          {
+            "scenario": "Metric definition differs from the company dashboard",
+            "impact": "Experiment 'wins' never show up in business reporting.",
+            "mitigation": "One shared metric layer (semantic layer / dbt) used by both."
+          }
+        ]
+      }
+    },
+    {
+      "id": "metrics",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Metrics Pipeline",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["SQL / Spark", "dbt metric layer", "Airflow"],
+        "io": {
+          "input": [{ "name": "Joined data", "type": "SQL: exposures ⋈ events ON user_id AND event.ts >= first_exposure_ts" }],
+          "output": [{ "name": "Sufficient statistics", "type": "JSON per variant × metric: { n, sum, sumSq, preSum, preSumSq, crossSum }" }]
+        },
+        "responsibilities": [
+          "Attributes only events that happened after each user's first exposure.",
+          "Computes per-user values, caps outliers (e.g. revenue at the 99.9th percentile), and handles ratio metrics with the delta method.",
+          "Reduces billions of rows to a few sums per variant, which is all the statistics need."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ratio metric analysed as if sessions were independent",
+            "impact": "Variance underestimated, so false positives look significant.",
+            "mitigation": "Randomization unit = analysis unit (user); delta method for per-session ratios."
+          },
+          {
+            "scenario": "One whale customer in treatment",
+            "impact": "Revenue lift driven by a single user.",
+            "mitigation": "Winsorize or cap outliers; report a median or trimmed mean alongside."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stats",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Statistics Engine",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Welch's t-test", "Sequential testing (mSPRT)", "CUPED", "SRM χ² test"],
+        "io": {
+          "input": [{ "name": "Per-variant sums", "type": "JSON: { n, sum, sumSq, … } per variant × metric" }],
+          "output": [
+            { "name": "Results", "type": "JSON: { metric, lift, ci95: [lo, hi], pValue, srm: { pValue, ok } }" },
+            { "name": "Auto-stop", "type": "Guardrail breach → { experimentKey, action: \"stop\" }" }
+          ]
+        },
+        "responsibilities": [
+          "Checks sample-ratio mismatch first (χ² on assignment counts); a failure invalidates every other number.",
+          "Estimates lift with confidence intervals; sequential tests keep error rates honest when people check daily.",
+          "Monitors guardrails continuously and triggers the kill switch on a clear harm."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Peeking: stopping the first day p < 0.05 with a fixed-horizon test",
+            "impact": "False-positive rate rises from 5% to 20-30%.",
+            "mitigation": "Sequential or always-valid p-values, or hide p-values until the planned end date."
+          },
+          {
+            "scenario": "Sample ratio mismatch ignored (e.g. 50.8% / 49.2% on 1M users)",
+            "impact": "Some users are missing from one arm, so any measured 'effect' may just be selection.",
+            "mitigation": "Block result display on SRM; investigate assignment, redirects, and event loss."
+          },
+          {
+            "scenario": "Novelty effect",
+            "impact": "Users click a new design because it's new, and the lift fades after two weeks.",
+            "mitigation": "Run full weekly cycles; plot the effect over days since first exposure."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dashboard",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Results Dashboard",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Scorecards", "Experiment review"],
+        "io": {
+          "input": [{ "name": "Results", "type": "JSON: primary, secondary, and guardrail metrics with CIs + SRM status" }],
+          "output": [{ "name": "Decision", "type": "ship | iterate | kill + written rationale" }]
+        },
+        "responsibilities": [
+          "Shows the primary metric first, guardrails second, and labels exploratory metrics as exploratory.",
+          "Explains results in plain language: 'between +0.4% and +2.1%, most likely +1.2%'.",
+          "Records decisions and rationale so the organisation learns from its experiments."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cherry-picking a winning segment ('it worked on Android in Germany')",
+            "impact": "Shipping noise as if it were a real effect.",
+            "mitigation": "Segment results carry multiple-comparison warnings; confirm with a follow-up test."
+          },
+          {
+            "scenario": "Network effects (marketplaces, social features)",
+            "impact": "Treatment users affect control users, so user-level A/B results are biased.",
+            "mitigation": "Randomize by cluster (city, team) or use switchback designs; flag these experiments."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-console-config", "source": "console", "sourceHandle": "r", "target": "config", "targetHandle": "l", "data": { "flow": "setup", "payload": "definition v3", "steps": [1, 8] } },
+    { "id": "e-config-sdk", "source": "config", "sourceHandle": "b", "target": "sdk", "targetHandle": "t", "data": { "flow": "setup", "payload": "ruleset (CDN + stream) → local hash", "steps": [2, 3] } },
+    { "id": "e-sdk-collector", "source": "sdk", "sourceHandle": "r", "target": "collector", "targetHandle": "l", "data": { "flow": "realtime", "payload": "exposures + events", "steps": [4] } },
+    { "id": "e-collector-warehouse", "source": "collector", "sourceHandle": "r", "target": "warehouse", "targetHandle": "l", "data": { "flow": "realtime", "payload": "validated, deduped", "steps": [5] } },
+    { "id": "e-warehouse-metrics", "source": "warehouse", "sourceHandle": "t", "target": "metrics", "targetHandle": "b", "data": { "flow": "pipeline", "payload": "exposures ⋈ events", "steps": [6], "bidirectional": true } },
+    { "id": "e-metrics-stats", "source": "metrics", "sourceHandle": "r", "target": "stats", "targetHandle": "l", "data": { "flow": "pipeline", "payload": "n, Σx, Σx² per variant", "steps": [6, 7] } },
+    { "id": "e-stats-dashboard", "source": "stats", "sourceHandle": "b", "target": "dashboard", "targetHandle": "t", "data": { "flow": "decision", "payload": "lift, CI, SRM", "steps": [7, 8] } },
+    { "id": "e-stats-config", "source": "stats", "sourceHandle": "t", "target": "config", "targetHandle": "t", "data": { "flow": "decision", "payload": "guardrail breach → auto-stop", "steps": [7] } }
+  ]
+}
