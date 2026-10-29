@@ -1,0 +1,264 @@
+{
+  "schemaVersion": 1,
+  "id": "llm-serving",
+  "title": "LLM Inference Serving",
+  "summary": "An LLM serving stack turns a prompt into a stream of tokens while sharing expensive GPUs across thousands of users. A gateway authenticates and rate-limits by tokens, a scheduler packs many requests into each GPU step with continuous batching, and the inference engine keeps each conversation's attention state in a paged KV cache. Usage is metered per token, and an autoscaler adds GPU replicas from queue depth and cache pressure, though each new replica takes minutes to load its weights.",
+  "flows": {
+    "request": { "label": "Requests & token stream", "color": "#38bdf8" },
+    "gpu": { "label": "Batching & GPU execution", "color": "#a78bfa" },
+    "control": { "label": "Weights & scaling control", "color": "#fbbf24" },
+    "usage": { "label": "Usage metering", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Send the prompt", "text": "The app calls POST /v1/chat/completions with stream: true. The connection stays open as Server-Sent Events, so the first words can appear in a few hundred milliseconds instead of after the whole answer is done." },
+    { "step": 2, "title": "Admit and route", "text": "The gateway checks the API key, estimates prompt plus max_tokens against the tenant's tokens-per-minute budget, and routes to the pool serving the requested model. Over-budget requests get a 429 with Retry-After." },
+    { "step": 3, "title": "Queue and batch", "text": "The scheduler queues the request and, on every GPU step, adds new requests to the running batch as soon as KV cache blocks are free. This continuous batching keeps 50 to 200 sequences sharing each forward pass." },
+    { "step": 4, "title": "Prefill the prompt", "text": "The engine processes all prompt tokens in one compute-heavy pass and writes their keys and values into paged KV cache blocks. If the prompt starts with a cached prefix, such as a shared system prompt, those blocks are reused and skipped." },
+    { "step": 5, "title": "Decode and stream", "text": "Decode generates one token per step for every sequence in the batch, limited by memory bandwidth rather than compute. Each token flows back through the scheduler and gateway to the client as an SSE event, typically 30 to 100 tokens per second per user." },
+    { "step": 6, "title": "Meter the usage", "text": "When the stream ends, the gateway emits a usage record with exact input, cached, and output token counts. Billing and quota dashboards consume these asynchronously." },
+    { "step": 7, "title": "Scale on pressure", "text": "The autoscaler watches queue depth, time to first token, and KV cache utilisation. When they stay high, it requests more GPU replicas; when idle, it drains replicas gracefully so in-flight streams finish." },
+    { "step": 8, "title": "Cold-start a replica", "text": "A new replica pulls tens to hundreds of gigabytes of weights from the registry, loads them into GPU memory, and warms up CUDA graphs. This takes 1 to 10 minutes, so scaling must start well before the queue overflows." }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Client App & SDK",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["OpenAI-compatible SDK", "Server-Sent Events", "fetch streaming"],
+        "io": {
+          "input": [{ "name": "Token stream", "type": "SSE: data: { choices: [{ delta: { content: \"Hel\" } }] } … data: [DONE]" }],
+          "output": [{ "name": "Completion request", "type": "POST /v1/chat/completions { model, messages[], max_tokens: 1024, stream: true }" }]
+        },
+        "responsibilities": [
+          "Opens a streaming request and renders tokens as they arrive.",
+          "Sets max_tokens and a timeout, and cancels the request when the user navigates away so the GPU slot is freed.",
+          "Retries 429 and 503 responses with backoff, honouring Retry-After."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Proxy or load balancer buffers the SSE response",
+            "impact": "The user sees nothing for 20 seconds, then the whole answer at once.",
+            "mitigation": "Disable response buffering (X-Accel-Buffering: no), send keep-alive comments, use HTTP/2."
+          },
+          {
+            "scenario": "Client disconnects but the server keeps generating",
+            "impact": "GPU time and KV cache are wasted on tokens nobody reads.",
+            "mitigation": "Propagate disconnects to the scheduler, which aborts the sequence and frees its blocks."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "API Gateway",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Envoy", "Redis (token buckets)", "Tokenizer (tiktoken / SentencePiece)"],
+        "io": {
+          "input": [{ "name": "Completion request", "type": "HTTPS POST + Authorization: Bearer sk-…" }],
+          "output": [
+            { "name": "Routed request", "type": "gRPC: { requestId, tenantId, model: \"llama-3-70b\", promptTokens: 1840, maxTokens: 1024, priority }" },
+            { "name": "Usage record", "type": "Event: { requestId, tenantId, model, inputTokens, cachedTokens, outputTokens }" }
+          ]
+        },
+        "responsibilities": [
+          "Authenticates keys and enforces per-tenant requests-per-minute and tokens-per-minute limits.",
+          "Tokenizes the prompt to estimate cost, then routes by model name and region to the right GPU pool.",
+          "Relays the token stream to the client and counts tokens for billing."
+        ],
+        "failureModes": [
+          {
+            "scenario": "One tenant floods the service with long prompts",
+            "impact": "Noisy neighbour: everyone else's queue time and TTFT climb.",
+            "mitigation": "Token-based (not request-based) limits, per-tenant concurrency caps, and fair-share queues."
+          },
+          {
+            "scenario": "Rate limiter store (Redis) unavailable",
+            "impact": "Either everything is rejected or limits stop applying.",
+            "mitigation": "Fail open with local per-instance limits for a short window, and alert."
+          }
+        ]
+      }
+    },
+    {
+      "id": "scheduler",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Scheduler & Request Queue",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["vLLM scheduler", "Priority queues", "KV-aware router"],
+        "io": {
+          "input": [{ "name": "Routed request", "type": "gRPC: { requestId, promptTokens, maxTokens, priority }" }],
+          "output": [{ "name": "Batch step", "type": "Step: { prefill: [seq 41: 512-token chunk], decode: [seq 3, 7, 12, … 96 seqs] }" }]
+        },
+        "responsibilities": [
+          "Picks a replica, preferring one that already holds this prompt's prefix in cache.",
+          "Builds each GPU step with continuous batching, mixing prefill chunks with ongoing decodes.",
+          "Admits a new sequence only when enough KV cache blocks are free, and preempts when they run out."
+        ],
+        "failureModes": [
+          {
+            "scenario": "A 100k-token prompt is prefilled in one step",
+            "impact": "Head-of-line blocking: every other user's stream stalls for seconds.",
+            "mitigation": "Chunked prefill (e.g. 512 to 2,048 tokens per step) interleaved with decode steps."
+          },
+          {
+            "scenario": "KV cache exhausted mid-generation",
+            "impact": "Sequences are preempted and their cache is recomputed later, so latency spikes.",
+            "mitigation": "Admission control on projected cache use, swap to CPU memory, and lower max batch size."
+          }
+        ]
+      }
+    },
+    {
+      "id": "metering",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Usage Metering & Billing",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Kafka", "ClickHouse", "Stripe Billing"],
+        "io": {
+          "input": [{ "name": "Usage record", "type": "Event: { requestId, tenantId, model, inputTokens, cachedTokens, outputTokens, ts }" }],
+          "output": [{ "name": "Aggregates", "type": "Rows: (tenantId, model, hour) → tokens, cost_usd" }]
+        },
+        "responsibilities": [
+          "Stores one record per request, deduplicated by requestId, priced per million tokens.",
+          "Feeds usage dashboards, invoices, and monthly spend caps."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Metering pipeline lags or is down",
+            "impact": "Serving continues, but dashboards are stale and spend caps trigger late.",
+            "mitigation": "Durable queue with replay; enforce hard caps from gateway counters, not from billing."
+          },
+          {
+            "scenario": "Stream aborted before the final usage chunk",
+            "impact": "Tokens are generated but never billed, or billed twice on retry.",
+            "mitigation": "Engine reports final counts on abort as well; idempotent writes keyed by requestId."
+          }
+        ]
+      }
+    },
+    {
+      "id": "engine",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Inference Engine (GPU Replicas)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["vLLM / TensorRT-LLM", "PagedAttention", "NVIDIA H100 (8x, tensor parallel)", "CUDA graphs"],
+        "io": {
+          "input": [{ "name": "Batch step", "type": "Step: { prefill chunks, decode seqs, block tables }" }],
+          "output": [
+            { "name": "Next tokens", "type": "Per seq: { seqId, tokenId, logprob, finishReason? }" },
+            { "name": "Metrics", "type": "Prometheus: kv_cache_usage, num_waiting, ttft_seconds, tokens_per_s" }
+          ]
+        },
+        "responsibilities": [
+          "Runs prefill (compute-bound, whole prompt at once) and decode (memory-bound, one token per sequence per step).",
+          "Stores attention keys and values in fixed 16-token blocks (PagedAttention), so memory is not wasted on padding.",
+          "Shares blocks between requests with the same prefix, so a repeated system prompt is computed once."
+        ],
+        "failureModes": [
+          {
+            "scenario": "GPU out of memory from too large a batch or context",
+            "impact": "The replica crashes and every in-flight stream on it fails.",
+            "mitigation": "Reserve memory up front (gpu_memory_utilization ≈ 0.9), cap max_model_len, health checks drain bad nodes."
+          },
+          {
+            "scenario": "Batch size tuned purely for throughput",
+            "impact": "Tokens per GPU rise, but TTFT and per-user speed degrade for interactive users.",
+            "mitigation": "Separate latency and batch pools, or SLO-aware batching that caps batch size per pool."
+          },
+          {
+            "scenario": "One GPU in a tensor-parallel group fails (Xid error)",
+            "impact": "The whole 8-GPU replica stops.",
+            "mitigation": "Node health monitoring, automatic cordon and replace, requests retried on another replica."
+          }
+        ]
+      }
+    },
+    {
+      "id": "registry",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Model Registry & Weight Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["S3 / GCS", "safetensors", "Local NVMe cache"],
+        "io": {
+          "input": [{ "name": "Load request", "type": "GET s3://models/llama-3-70b/v3/*.safetensors" }],
+          "output": [{ "name": "Weights", "type": "safetensors shards (~140 GB at FP16, ~70 GB at FP8)" }]
+        },
+        "responsibilities": [
+          "Stores versioned, immutable weights, tokenizer, and serving config for each model.",
+          "Streams shards in parallel to new replicas, ideally from a node-local or in-cluster cache."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Object store throttles a burst of replicas loading at once",
+            "impact": "Cold starts stretch from 2 minutes to 15; scale-out arrives too late.",
+            "mitigation": "Pre-stage weights on node NVMe, peer-to-peer distribution, keep warm standby replicas."
+          },
+          {
+            "scenario": "Wrong weight version deployed",
+            "impact": "Quality regressions or tokenizer mismatch produce garbage output.",
+            "mitigation": "Pin versions by checksum, canary a small share of traffic, run eval suites before rollout."
+          }
+        ]
+      }
+    },
+    {
+      "id": "autoscaler",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Autoscaler",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Kubernetes + KEDA", "Prometheus", "Cluster autoscaler"],
+        "io": {
+          "input": [{ "name": "Metrics", "type": "Prometheus: num_waiting, kv_cache_usage, p95 ttft" }],
+          "output": [{ "name": "Scale action", "type": "K8s: replicas 6 → 9 (model=llama-3-70b)" }]
+        },
+        "responsibilities": [
+          "Scales on queue depth and KV cache utilisation, not CPU, which says nothing about GPU load.",
+          "Scales out early to cover multi-minute cold starts, and scales in slowly, draining streams first."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Traffic spike faster than replicas can cold-start",
+            "impact": "Queues grow, TTFT rises to tens of seconds, gateway starts shedding with 503s.",
+            "mitigation": "Warm buffer capacity, predictive scaling from daily patterns, priority shedding of batch traffic."
+          },
+          {
+            "scenario": "No GPUs available in the region",
+            "impact": "Scale requests hang; capacity is fixed at current size.",
+            "mitigation": "Reserved capacity, multi-region failover, fall back to a smaller or quantized model."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-gateway", "source": "client", "sourceHandle": "r", "target": "gateway", "targetHandle": "l", "data": { "flow": "request", "payload": "POST stream:true ⇄ SSE tokens", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-gateway-scheduler", "source": "gateway", "sourceHandle": "r", "target": "scheduler", "targetHandle": "l", "data": { "flow": "request", "payload": "routed request ⇄ tokens", "steps": [2, 5], "bidirectional": true } },
+    { "id": "e-gateway-metering", "source": "gateway", "sourceHandle": "b", "target": "metering", "targetHandle": "l", "data": { "flow": "usage", "payload": "usage { input, output tokens }", "steps": [6] } },
+    { "id": "e-scheduler-engine", "source": "scheduler", "sourceHandle": "r", "target": "engine", "targetHandle": "l", "data": { "flow": "gpu", "payload": "batch step ⇄ next tokens", "steps": [3, 4, 5], "bidirectional": true } },
+    { "id": "e-engine-registry", "source": "engine", "sourceHandle": "r", "target": "registry", "targetHandle": "l", "data": { "flow": "control", "payload": "load weights (cold start)", "steps": [8], "bidirectional": true } },
+    { "id": "e-engine-autoscaler", "source": "engine", "sourceHandle": "b", "target": "autoscaler", "targetHandle": "l", "data": { "flow": "control", "payload": "metrics ⇄ add/drain replicas", "steps": [7], "bidirectional": true } }
+  ]
+}
