@@ -1,0 +1,304 @@
+{
+  "schemaVersion": 1,
+  "id": "food-delivery",
+  "title": "Food Delivery",
+  "summary": "A food delivery platform coordinates three parties who each move at their own pace: a customer who wants food fast, a restaurant that needs time to cook, and a courier who should arrive just as the food is ready. The order service runs a strict state machine and holds the payment, the dispatch engine matches orders to couriers by predicted arrival time rather than raw distance, and couriers stream GPS so everyone sees live progress. Most of the hard problems are timing problems: predicting prep and travel time well enough that food is neither cold nor waiting.",
+  "flows": {
+    "api": { "label": "Order & quote API calls", "color": "#38bdf8" },
+    "realtime": { "label": "Courier offers & GPS stream", "color": "#f472b6" },
+    "maps": { "label": "Maps & routing provider", "color": "#fbbf24" },
+    "events": { "label": "Order events & notifications", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Quote a delivery time", "text": "When the customer opens the checkout, the order service asks the ETA service for a quote: predicted prep time at this restaurant right now plus predicted travel time. The app shows a range such as 30-40 min." },
+    { "step": 2, "title": "Place the order", "text": "The app sends POST /orders with an Idempotency-Key. The order service creates the order in state CREATED and places an authorization hold on the card; nothing is charged yet, so a cancelled order costs the customer nothing." },
+    { "step": 3, "title": "Restaurant confirms", "text": "The order is pushed to the restaurant's tablet or POS integration. Staff accept it and confirm a prep time (say 15 min), or reject it because an item is sold out. Unconfirmed orders escalate to a phone call after about 3 minutes." },
+    { "step": 4, "title": "Hand off to dispatch", "text": "An order.accepted event with the expected ready_at time goes to the dispatch engine. Dispatch deliberately waits so the courier arrives at ready_at, not immediately; an early courier is an idle courier." },
+    { "step": 5, "title": "Score couriers and batches", "text": "Every few seconds dispatch collects open orders and nearby couriers from the geospatial index, asks the ETA service for a travel-time matrix, and solves an assignment problem. Two orders from the same restaurant may be batched onto one courier if neither gets more than a few minutes later." },
+    { "step": 6, "title": "Offer to a courier", "text": "The chosen courier gets an offer with pay and route and roughly 30 seconds to accept. A decline or timeout sends the order back into the next matching round, and the courier app starts streaming GPS every 4 seconds." },
+    { "step": 7, "title": "Pickup and live tracking", "text": "The courier navigates with turn-by-turn routes, marks the order picked up, and each GPS ping updates the geospatial index and the customer's live map. Trip events (picked_up, arriving) flow to the notification service." },
+    { "step": 8, "title": "Deliver, notify, and capture", "text": "On delivered, the customer gets a push notification, the order moves to DELIVERED, and the order service captures the payment, including the final tip. Actual prep and travel times are logged to retrain the ETA models." }
+  ],
+  "nodes": [
+    {
+      "id": "customer",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Customer App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android", "Push (APNs / FCM)", "Map SDK"],
+        "io": {
+          "input": [
+            { "name": "Order status & ETA", "type": "JSON: { orderId, state: \"PREPARING\" | \"PICKED_UP\" | \"DELIVERED\", eta: { min, max } }" },
+            { "name": "Live updates", "type": "Push notification + WebSocket courier location" }
+          ],
+          "output": [{ "name": "Place order", "type": "POST /v1/orders { restaurantId, items[], addressId, tip } + Idempotency-Key" }]
+        },
+        "responsibilities": [
+          "Builds the cart, shows the quoted delivery window, and places the order with a client-generated idempotency key.",
+          "Renders live order state and the courier's position on a map during delivery."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Customer taps 'Place order' twice on a slow network",
+            "impact": "Two identical orders and two card holds.",
+            "mitigation": "The idempotency key is generated once per checkout; the server returns the original order for a repeat."
+          },
+          {
+            "scenario": "WebSocket drops while the customer watches the map",
+            "impact": "The courier icon freezes and the customer assumes the order is stuck.",
+            "mitigation": "Reconnect with backoff, fall back to polling every 15 s, and show 'last updated' time."
+          }
+        ]
+      }
+    },
+    {
+      "id": "orders",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Order Service",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Postgres (orders + idempotency)", "Kafka", "Stripe / Adyen"],
+        "io": {
+          "input": [{ "name": "Place order", "type": "POST /v1/orders + Idempotency-Key" }],
+          "output": [
+            { "name": "To restaurant", "type": "JSON: { orderId, items[], notes, pickupBy }" },
+            { "name": "To dispatch", "type": "Event: order.accepted { orderId, restaurantId, readyAt, dropoff: { lat, lng } }" }
+          ]
+        },
+        "responsibilities": [
+          "Owns the order state machine: CREATED → CONFIRMED → PREPARING → PICKED_UP → DELIVERED (or CANCELLED), rejecting illegal transitions.",
+          "Deduplicates placement by idempotency key, places an authorization hold at checkout, and captures only on delivery.",
+          "Publishes every state change to Kafka for dispatch, notifications, and analytics."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Payment provider times out, then the request is retried",
+            "impact": "The customer sees two holds, or is double-charged on capture.",
+            "mitigation": "Pass the order id as the provider's idempotency key; reconcile unknown authorizations before retrying."
+          },
+          {
+            "scenario": "Restaurant never confirms the order",
+            "impact": "The customer waits with a hold on their card and no food in progress.",
+            "mitigation": "Timer per state: auto-call the restaurant after ~3 min, auto-cancel and release the hold after ~10 min."
+          }
+        ]
+      }
+    },
+    {
+      "id": "restaurant",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Restaurant Tablet & POS Integration",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Merchant tablet app", "POS APIs (Toast, Square)", "IVR auto-call"],
+        "io": {
+          "input": [{ "name": "New order", "type": "JSON: { orderId, items[], notes, pickupBy } (push / POS webhook)" }],
+          "output": [{ "name": "Confirmation", "type": "JSON: { orderId, status: \"accepted\" | \"rejected\", prepMinutes: 15, reason? }" }]
+        },
+        "responsibilities": [
+          "Alerts staff loudly until an order is accepted or rejected, and captures their prep-time estimate.",
+          "Marks items out of stock and pauses the store when the kitchen is overwhelmed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Tablet offline or muted during the dinner rush",
+            "impact": "Orders sit unconfirmed; food is late or never made.",
+            "mitigation": "Heartbeat monitoring, automated phone call fallback, and auto-pause the store after repeated misses."
+          },
+          {
+            "scenario": "Staff accept with the default prep time regardless of load",
+            "impact": "Couriers arrive early and wait, or food sits and goes cold.",
+            "mitigation": "ETA service learns each store's real prep time and overrides the stated value when they disagree."
+          }
+        ]
+      }
+    },
+    {
+      "id": "eta",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "ETA Prediction Service",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Gradient-boosted models (LightGBM)", "Feature store (Redis)", "Online serving < 20 ms"],
+        "io": {
+          "input": [{ "name": "Quote request", "type": "JSON: { restaurantId, dropoff, courierIds[]?, time }" }],
+          "output": [{ "name": "Prediction", "type": "JSON: { prepMin: 14, travelMin: { courierId: 9 }, p50: 28, p90: 37 }" }]
+        },
+        "responsibilities": [
+          "Predicts prep time from the restaurant's live order queue, time of day, and history, and travel time from the routing matrix plus courier speed.",
+          "Returns ranges (p50 / p90) rather than one number, so the app can promise a window it will usually meet.",
+          "Retrains daily on actual prep and delivery times logged from completed orders."
+        ],
+        "failureModes": [
+          {
+            "scenario": "ETAs too optimistic at peak (Friday 7 pm, rain)",
+            "impact": "Missed promises, refunds, and couriers dispatched too early.",
+            "mitigation": "Features for live demand, weather, and kitchen backlog; monitor ETA error per city per hour."
+          },
+          {
+            "scenario": "Service slow or down",
+            "impact": "Checkout and dispatch both lose their timing signal.",
+            "mitigation": "20 ms budget with fallback to per-restaurant historical averages plus straight-line distance."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dispatch",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Dispatch & Assignment Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Redis GEO / H3 cells", "Min-cost matching solver", "Kafka consumer"],
+        "io": {
+          "input": [
+            { "name": "Ready orders", "type": "Event: order.accepted { orderId, readyAt, pickup, dropoff }" },
+            { "name": "Courier locations", "type": "GPS ping: { courierId, lat, lng, heading, ts } every 4 s" }
+          ],
+          "output": [{ "name": "Courier offer", "type": "Push: { offerId, orderIds[], payout, pickupAt, expiresIn: 30 }" }]
+        },
+        "responsibilities": [
+          "Keeps courier positions in a geospatial index (H3 cells) and finds candidates near each pickup in milliseconds.",
+          "Every few seconds solves a batch assignment that minimises total lateness, matching by predicted arrival time rather than distance and batching compatible orders.",
+          "Re-assigns orders when an offer is declined, times out, or the courier stops moving."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Two dispatch workers assign the same courier or order",
+            "impact": "Two couriers drive to one order, or one courier gets conflicting jobs.",
+            "mitigation": "Partition dispatch by city/zone and claim with a compare-and-set on the order's assignment version."
+          },
+          {
+            "scenario": "Courier goes offline mid-delivery or GPS goes stale",
+            "impact": "The order looks in progress but nobody is moving; the customer's ETA is fiction.",
+            "mitigation": "Flag couriers with no ping for 60 s, call them, and re-dispatch if pickup has not happened."
+          },
+          {
+            "scenario": "Dinner-time demand spike outruns courier supply",
+            "impact": "Unassigned orders pile up and delivery times stretch past an hour.",
+            "mitigation": "Surge pay to attract couriers, wider delivery-time quotes, and temporarily shrinking delivery radius."
+          }
+        ]
+      }
+    },
+    {
+      "id": "courier",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Courier App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android background location", "MQTT / WebSocket", "Offline queue"],
+        "io": {
+          "input": [{ "name": "Offer", "type": "Push: { offerId, orderIds[], payout, pickupAt, expiresIn: 30 }" }],
+          "output": [
+            { "name": "Location", "type": "GPS ping: { courierId, lat, lng, accuracyM, ts } every 4 s" },
+            { "name": "Trip events", "type": "Event: { orderId, type: \"accepted\" | \"picked_up\" | \"delivered\", proofPhoto? }" }
+          ]
+        },
+        "responsibilities": [
+          "Shows offers, streams GPS every few seconds while on a job, and buffers pings when the network drops.",
+          "Records pickup and drop-off events with photo or PIN proof of delivery."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Noisy or spoofed GPS (tunnels, high-rises, fake-location apps)",
+            "impact": "Wrong ETAs, or fake deliveries marked complete.",
+            "mitigation": "Snap pings to roads, drop low-accuracy fixes, and require geofenced drop-off plus proof photo."
+          },
+          {
+            "scenario": "Phone OS kills the background app",
+            "impact": "Location stops; dispatch thinks the courier vanished.",
+            "mitigation": "Foreground service with persistent notification; dispatch tolerates short gaps before re-assigning."
+          }
+        ]
+      }
+    },
+    {
+      "id": "maps",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Maps & Routing Provider",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["Google Maps / Mapbox", "OSRM (self-hosted)", "Live traffic"],
+        "io": {
+          "input": [{ "name": "Matrix / route request", "type": "JSON: { origins[], destinations[], mode: \"bike\" | \"car\", departAt }" }],
+          "output": [{ "name": "Travel times", "type": "JSON: { durationsSec[][], distancesM[][], polyline }" }]
+        },
+        "responsibilities": [
+          "Returns travel-time matrices for dispatch scoring and turn-by-turn routes for couriers, with live traffic.",
+          "Geocodes addresses and stores drop-off pins and entrance notes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Provider quota exhausted or latency spikes",
+            "impact": "Dispatch rounds slow down or stall.",
+            "mitigation": "Self-hosted OSRM for bulk matrices, cache travel times per H3 cell pair, paid API only for final routes."
+          },
+          {
+            "scenario": "Bad geocode for a new building",
+            "impact": "Courier goes to the wrong entrance; delivery takes 10 extra minutes.",
+            "mitigation": "Let customers drag the pin; learn corrected drop-off points from past deliveries."
+          }
+        ]
+      }
+    },
+    {
+      "id": "notify",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 240 },
+      "data": {
+        "label": "Notification Service",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka consumers", "APNs / FCM", "Twilio SMS"],
+        "io": {
+          "input": [{ "name": "Trip & order events", "type": "Event: { orderId, type: \"picked_up\" | \"arriving\" | \"delivered\", eta }" }],
+          "output": [{ "name": "Customer alert", "type": "Push: \"Your courier is 2 min away\" + live-location channel" }]
+        },
+        "responsibilities": [
+          "Turns order and trip events into push, SMS, and in-app messages, deduplicated per event id.",
+          "Fans live courier location to the customer's open tracking session."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Events arrive out of order",
+            "impact": "Customer gets 'picked up' after 'delivered'.",
+            "mitigation": "Compare against the order's current state version and drop stale notifications."
+          },
+          {
+            "scenario": "Push provider delays during a spike",
+            "impact": "Customers miss 'courier arriving' and the courier waits at the door.",
+            "mitigation": "SMS fallback for arrival alerts; courier app offers a one-tap masked call."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-customer-orders", "source": "customer", "sourceHandle": "r", "target": "orders", "targetHandle": "l", "data": { "flow": "api", "payload": "POST /orders ⇄ status + quote", "steps": [1, 2, 8], "bidirectional": true } },
+    { "id": "e-orders-eta", "source": "orders", "sourceHandle": "b", "target": "eta", "targetHandle": "l", "data": { "flow": "api", "payload": "quote ⇄ prep + travel (p50/p90)", "steps": [1], "bidirectional": true } },
+    { "id": "e-orders-restaurant", "source": "orders", "sourceHandle": "t", "target": "restaurant", "targetHandle": "l", "data": { "flow": "api", "payload": "new order ⇄ accept + prep min", "steps": [3], "bidirectional": true } },
+    { "id": "e-orders-dispatch", "source": "orders", "sourceHandle": "r", "target": "dispatch", "targetHandle": "l", "data": { "flow": "events", "payload": "order.accepted (readyAt)", "steps": [4] } },
+    { "id": "e-dispatch-eta", "source": "dispatch", "sourceHandle": "b", "target": "eta", "targetHandle": "r", "data": { "flow": "api", "payload": "candidate ETAs per courier", "steps": [5], "bidirectional": true } },
+    { "id": "e-eta-maps", "source": "eta", "sourceHandle": "b", "target": "maps", "targetHandle": "b", "data": { "flow": "maps", "payload": "travel-time matrix", "steps": [5], "bidirectional": true } },
+    { "id": "e-dispatch-courier", "source": "dispatch", "sourceHandle": "t", "target": "courier", "targetHandle": "l", "data": { "flow": "realtime", "payload": "offer ⇄ accept; GPS every 4 s", "steps": [6, 7], "bidirectional": true } },
+    { "id": "e-courier-maps", "source": "courier", "sourceHandle": "b", "target": "maps", "targetHandle": "t", "data": { "flow": "maps", "payload": "turn-by-turn route", "steps": [7], "bidirectional": true } },
+    { "id": "e-courier-notify", "source": "courier", "sourceHandle": "r", "target": "notify", "targetHandle": "l", "data": { "flow": "events", "payload": "picked_up / arriving / delivered", "steps": [7, 8] } },
+    { "id": "e-notify-customer", "source": "notify", "sourceHandle": "t", "target": "customer", "targetHandle": "t", "data": { "flow": "events", "payload": "push + live courier location", "steps": [8] } }
+  ]
+}

@@ -1,0 +1,311 @@
+{
+  "schemaVersion": 1,
+  "id": "product-search",
+  "title": "Product Search",
+  "summary": "Product search turns a few typed words into a ranked, filterable list of products in about 100 milliseconds. An indexing pipeline copies every catalogue, price, and stock change into a search index within seconds. At query time the search API cleans up the query, retrieves matching products with facet counts, and re-ranks the top few hundred with a model trained on what shoppers actually click and buy.",
+  "flows": {
+    "indexing": { "label": "Indexing (change data capture)", "color": "#a78bfa" },
+    "query": { "label": "Query path", "color": "#38bdf8" },
+    "behaviour": { "label": "Click & purchase events", "color": "#f472b6" },
+    "training": { "label": "Ranker training (offline)", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Capture the change", "text": "A merchandiser cuts a price, or a warehouse sells the last unit. The row commits in the catalogue database, and Debezium reads it from the write-ahead log and publishes a change event to Kafka, usually within a second." },
+    { "step": 2, "title": "Denormalise and enrich", "text": "A stream job joins product, price, inventory, and category into one flat search document. It also adds a popularity score and a text embedding, because the index cannot do joins at query time." },
+    { "step": 3, "title": "Write to the index", "text": "Documents are bulk-upserted into OpenSearch. Each field's text is split into tokens for the inverted index, and new documents become searchable at the next refresh, about 1 second later." },
+    { "step": 4, "title": "Autocomplete and understand", "text": "Suggestions appear as the shopper types, in under 50ms. On submit, the search API fixes spelling (\"iphnoe\" becomes \"iphone\"), expands synonyms (\"sofa\" also matches \"couch\"), and detects category intent, so \"red running shoes\" becomes a category filter, a colour filter, and the text \"running\"." },
+    { "step": 5, "title": "Retrieve with facets", "text": "One query runs BM25 text matching (optionally mixed with vector similarity), applies filters such as in-stock and price range, and computes facet counts (brand, size, price buckets) as aggregations. It returns the top ~500 candidates." },
+    { "step": 6, "title": "Re-rank the top results", "text": "A learning-to-rank model rescores the candidates using features like text score, click-through rate, conversion rate, margin, and stock. Only the top few hundred are rescored, so this stays within a ~20ms budget." },
+    { "step": 7, "title": "Show results and log behaviour", "text": "The page renders 48 results with facets. Every impression, click, add-to-cart, and purchase is logged with the query and the result's position." },
+    { "step": 8, "title": "Retrain the ranker", "text": "Each night, logged sessions become training labels (purchase > add-to-cart > click > skipped). A new LambdaMART model is trained, checked offline, A/B tested, and then promoted." }
+  ],
+  "nodes": [
+    {
+      "id": "search-ui",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Search Box & Results Page",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["React / native apps", "Analytics SDK"],
+        "io": {
+          "input": [
+            { "name": "Suggestions & results", "type": "JSON: { suggestions[] } | { total, hits: [{ sku, title, price, inStock }], facets }" }
+          ],
+          "output": [
+            { "name": "Search request", "type": "GET /search?q=red+running+shoes&size=10&brand=nike&page=1" },
+            { "name": "Behaviour events", "type": "Event: { type: \"impression\" | \"click\" | \"add_to_cart\" | \"purchase\", queryId, sku, position }" }
+          ]
+        },
+        "responsibilities": [
+          "Debounces keystrokes (~100ms) and cancels stale autocomplete requests so the API isn't flooded.",
+          "Keeps the query, filters, and page in the URL so results can be shared and cached.",
+          "Logs impressions and clicks with their position and query ID so ranking can learn from them."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Zero results for a real query (\"addidas sambas\")",
+            "impact": "The shopper usually leaves; zero-result pages convert far worse than any other page.",
+            "mitigation": "Retry automatically with relaxed matching, show 'did you mean', and review the top zero-result queries every week."
+          },
+          {
+            "scenario": "Deep pagination (page 400)",
+            "impact": "Each shard must sort from+size documents, so latency and memory grow with page depth.",
+            "mitigation": "Cap result windows (~10,000) and use search_after cursors for infinite scroll."
+          }
+        ]
+      }
+    },
+    {
+      "id": "analytics",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Behaviour Analytics & LTR Training",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka", "Spark", "LightGBM (LambdaMART)", "Feature store"],
+        "io": {
+          "input": [{ "name": "Behaviour events", "type": "Kafka topic search-events: { queryId, sku, position, type, ts }" }],
+          "output": [
+            { "name": "Ranking model", "type": "Model artifact: ltr-2026-10-27.txt + feature list" },
+            { "name": "Product features", "type": "JSON: { sku, ctr_7d, conversion_30d, revenue_per_impression }" }
+          ]
+        },
+        "responsibilities": [
+          "Joins impressions with later clicks and purchases into graded relevance labels per query.",
+          "Computes per-product and per-query features such as 7-day click-through and conversion rate.",
+          "Trains, evaluates (NDCG@10), and A/B tests a new ranking model before it serves traffic."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Popularity feedback loop",
+            "impact": "Top-ranked items get the most clicks, so they stay on top and new products never get seen.",
+            "mitigation": "Correct for position bias in labels and reserve a few slots for exploring new or rarely shown items."
+          },
+          {
+            "scenario": "Bot traffic or a scraper in the click logs",
+            "impact": "Fake clicks inflate some items and corrupt the next model.",
+            "mitigation": "Filter bots by behaviour and user agent before labelling; alert on sudden CTR jumps."
+          }
+        ]
+      }
+    },
+    {
+      "id": "search-api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Search API & Query Understanding",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Go / Java service", "SymSpell spell correction", "Intent classifier", "Redis cache"],
+        "io": {
+          "input": [{ "name": "Search request", "type": "HTTP GET /search?q=…&filters…&page=…" }],
+          "output": [
+            { "name": "Index query", "type": "JSON: { bool: { must: [multi_match], filter: [category, inStock] }, aggs: { brand, size, price } }" },
+            { "name": "Rerank request", "type": "JSON: { queryId, query, candidates: [{ sku, bm25 }] x500 }" }
+          ]
+        },
+        "responsibilities": [
+          "Normalises the query: lowercasing, spell correction, synonym expansion, and unit handling (\"55 inch\" = \"55in\").",
+          "Detects category and attribute intent, then turns it into filters or boosts.",
+          "Orchestrates retrieval, re-ranking, and caching within a ~100ms latency budget at p99."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Over-eager spell correction or synonyms",
+            "impact": "\"Apple\" the brand gets mixed with fruit, or a correct rare brand name gets 'fixed'.",
+            "mitigation": "Correct only when the original returns few results; keep curated synonym lists per category."
+          },
+          {
+            "scenario": "Traffic spike (sale launch)",
+            "impact": "The search cluster saturates and every page that shows search slows down.",
+            "mitigation": "Cache the top ~10% of queries for a short time, enforce per-client rate limits, and shed facet work first."
+          }
+        ]
+      }
+    },
+    {
+      "id": "search-index",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Search Index",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["OpenSearch / Elasticsearch", "Inverted index + BM25", "HNSW vectors (hybrid)"],
+        "io": {
+          "input": [
+            { "name": "Bulk upserts", "type": "POST /_bulk (NDJSON) to alias products" },
+            { "name": "Query", "type": "POST /products/_search { query, filter, aggs, size: 500 }" }
+          ],
+          "output": [{ "name": "Hits & facets", "type": "JSON: { hits: [{ _id, _score }], aggregations: { brand: { buckets: [{ key, doc_count }] } } }" }]
+        },
+        "responsibilities": [
+          "Maps each token to a sorted list of matching products (the inverted index) and scores matches with BM25.",
+          "Applies filters from cached bitsets and computes facet counts as aggregations over the matching set.",
+          "Spreads ~10M products over primary shards with replicas, so queries run in parallel and survive node loss."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Full reindex after a mapping or analyzer change",
+            "impact": "Rebuilding in place would mean hours of missing or half-indexed results.",
+            "mitigation": "Build products_v2 alongside, replay changes made since it started, then switch the 'products' alias atomically."
+          },
+          {
+            "scenario": "Facet counts on very broad queries (\"shoes\", 2M matches)",
+            "impact": "Aggregations dominate latency and CPU across all shards.",
+            "mitigation": "Use eager global ordinals on facet fields, cap facet sizes, and sample or cache counts for broad queries."
+          },
+          {
+            "scenario": "Shard hot spot",
+            "impact": "One shard holding a viral product or a giant category gets most traffic, and its node's p99 latency rises.",
+            "mitigation": "Route by hashed ID rather than category, add replicas, and use adaptive replica selection."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ranker",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Learning-to-Rank Re-ranker",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["LightGBM / XGBoost inference", "OpenSearch LTR plugin", "Feature store (Redis)"],
+        "io": {
+          "input": [
+            { "name": "Candidates", "type": "JSON: { queryId, query, candidates: [{ sku, bm25 }] }" },
+            { "name": "Model", "type": "Model artifact + feature definitions" }
+          ],
+          "output": [{ "name": "Ranked list", "type": "JSON: { queryId, ranked: [{ sku, score }], modelVersion }" }]
+        },
+        "responsibilities": [
+          "Looks up per-product and per-query features (CTR, conversion, margin, stock) for each candidate.",
+          "Scores the top ~500 candidates with the current model and returns them reordered.",
+          "Applies business rules after the model: hide out-of-stock items, pin sponsored slots, diversify brands."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Re-ranker slow or down",
+            "impact": "Results lose their learned ordering; conversion drops a few percent.",
+            "mitigation": "Use a ~20ms timeout, then fall back to BM25 plus a static popularity boost."
+          },
+          {
+            "scenario": "A bad model is promoted",
+            "impact": "Relevance quietly gets worse across every query.",
+            "mitigation": "Ramp the new model behind an A/B test, watch conversion and zero-click rate, and roll back by version."
+          }
+        ]
+      }
+    },
+    {
+      "id": "indexer",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Indexing Pipeline",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Apache Flink", "Embedding model", "OpenSearch bulk API"],
+        "io": {
+          "input": [{ "name": "Change events", "type": "Kafka: product.updated | price.changed | stock.changed { sku, … }" }],
+          "output": [{ "name": "Search document", "type": "JSON: { sku, title, brand, categoryPath, price, inStock, popularity, embedding: float[384] }" }]
+        },
+        "responsibilities": [
+          "Joins product, price, and inventory streams into one denormalised document per SKU.",
+          "Enriches documents with category paths, popularity, and embeddings, then batches bulk writes (~5MB per request).",
+          "Gives fast-changing fields (price, stock) priority over slow ones (description, images)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Index lags behind price and stock changes",
+            "impact": "Shoppers see out-of-stock items or old prices, then hit errors at checkout.",
+            "mitigation": "Alert on end-to-end lag (target < 5s), process stock updates in a separate lane, and re-check stock on the product page."
+          },
+          {
+            "scenario": "Out-of-order events for the same SKU",
+            "impact": "An older price overwrites a newer one.",
+            "mitigation": "Partition Kafka by SKU and use external versioning (version = source LSN) so stale writes are rejected."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cdc",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Change Data Capture",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Debezium", "Kafka", "Schema registry"],
+        "io": {
+          "input": [{ "name": "Database log", "type": "Postgres logical replication (WAL)" }],
+          "output": [{ "name": "Change events", "type": "Kafka: { op: \"c\" | \"u\" | \"d\", before, after, source.lsn }" }]
+        },
+        "responsibilities": [
+          "Streams every committed row change from the database log, so no application code has to remember to publish events.",
+          "Keeps per-SKU ordering by partitioning topics on the product key.",
+          "Retains events for days so the pipeline can replay them after a bug or a reindex."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Connector stops and the replication slot grows",
+            "impact": "The index goes stale, and the database's disk fills with retained WAL.",
+            "mitigation": "Alert on slot lag; cap retained WAL size; run connectors on Kafka Connect with automatic restarts."
+          },
+          {
+            "scenario": "Schema change in the catalogue table",
+            "impact": "Consumers fail to decode events and indexing stops.",
+            "mitigation": "Schema registry with backward-compatibility checks in CI before migrations ship."
+          }
+        ]
+      }
+    },
+    {
+      "id": "catalog",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 240 },
+      "data": {
+        "label": "Catalogue, Pricing & Inventory DBs",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["PostgreSQL", "Inventory service", "PIM (product information)"],
+        "io": {
+          "input": [{ "name": "Updates", "type": "SQL: UPDATE prices SET amount = 7999 WHERE sku = 'SKU-123'" }],
+          "output": [{ "name": "Row changes", "type": "WAL records: products, prices, inventory" }]
+        },
+        "responsibilities": [
+          "Holds the source of truth for product details, prices, and stock levels.",
+          "Accepts edits from merchandisers, pricing jobs, and warehouse systems; search never writes back."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bulk price update touches 2M rows at once",
+            "impact": "A burst of change events backs up the pipeline for tens of minutes.",
+            "mitigation": "Throttle bulk jobs, and route bulk changes to a separate low-priority topic."
+          },
+          {
+            "scenario": "Catalogue database unavailable",
+            "impact": "Search keeps serving from the index, but no new changes reach it.",
+            "mitigation": "Search reads only from the index; the product page re-checks price and stock before checkout."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-catalog-cdc", "source": "catalog", "sourceHandle": "l", "target": "cdc", "targetHandle": "r", "data": { "flow": "indexing", "payload": "WAL row changes", "steps": [1] } },
+    { "id": "e-cdc-indexer", "source": "cdc", "sourceHandle": "l", "target": "indexer", "targetHandle": "r", "data": { "flow": "indexing", "payload": "price.changed / stock.changed", "steps": [2] } },
+    { "id": "e-indexer-index", "source": "indexer", "sourceHandle": "t", "target": "search-index", "targetHandle": "r", "data": { "flow": "indexing", "payload": "_bulk upsert (alias: products)", "steps": [3] } },
+    { "id": "e-ui-api", "source": "search-ui", "sourceHandle": "r", "target": "search-api", "targetHandle": "l", "data": { "flow": "query", "payload": "GET /search ⇄ results + facets", "steps": [4, 7], "bidirectional": true } },
+    { "id": "e-api-index", "source": "search-api", "sourceHandle": "t", "target": "search-index", "targetHandle": "l", "data": { "flow": "query", "payload": "bool query + aggs ⇄ top 500", "steps": [5], "bidirectional": true } },
+    { "id": "e-api-ranker", "source": "search-api", "sourceHandle": "b", "target": "ranker", "targetHandle": "l", "data": { "flow": "query", "payload": "rerank 500 ⇄ ordered SKUs", "steps": [6], "bidirectional": true } },
+    { "id": "e-ui-analytics", "source": "search-ui", "sourceHandle": "b", "target": "analytics", "targetHandle": "t", "data": { "flow": "behaviour", "payload": "impression / click / purchase", "steps": [7] } },
+    { "id": "e-analytics-ranker", "source": "analytics", "sourceHandle": "b", "target": "ranker", "targetHandle": "b", "data": { "flow": "training", "payload": "nightly model + features", "steps": [8] } }
+  ]
+}

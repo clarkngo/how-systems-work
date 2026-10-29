@@ -1,0 +1,318 @@
+{
+  "schemaVersion": 1,
+  "id": "inventory-orders",
+  "title": "Inventory & Order Management",
+  "summary": "Once checkout has taken payment, an order still has to be matched to real units on a real shelf. The inventory service tracks available-to-promise stock per SKU per location, a sourcing engine picks which warehouse or store ships each line, and the warehouse system picks, packs, and ships. Every stock movement flows back out to the web store and marketplaces so they stop selling what is gone, and returns put sellable units back into stock.",
+  "flows": {
+    "orders": { "label": "Orders & status", "color": "#38bdf8" },
+    "allocation": { "label": "Sourcing & reservations", "color": "#a78bfa" },
+    "fulfilment": { "label": "Warehouse & shipping", "color": "#fbbf24" },
+    "stock": { "label": "Stock movement events", "color": "#34d399" },
+    "feeds": { "label": "Channel stock feeds (batched)", "color": "#22d3ee", "animated": false },
+    "returns": { "label": "Returns (RMA)", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "An order arrives", "text": "Paid orders come in from the web store's checkout, from marketplaces such as Amazon (pulled from their Orders API every few minutes), and from store POS systems. The OMS normalises them into one order format and deduplicates by channel order ID." },
+    { "step": 2, "title": "Choose where to ship from", "text": "For each line, the sourcing engine reads available-to-promise (ATP = on hand − reserved − safety stock) at every eligible warehouse and store, then scores options by distance, shipping cost, and how many packages the order would need." },
+    { "step": 3, "title": "Reserve the units", "text": "The chosen locations are reserved with a conditional update, so two orders can never claim the same last unit. If a line can't be filled from one place, the order is split into several shipments or backordered." },
+    { "step": 4, "title": "Release to the warehouse", "text": "The OMS moves the order from allocated to released and sends a fulfilment order to the warehouse system. Releases are often batched into pick waves every 15 to 30 minutes." },
+    { "step": 5, "title": "Pick, pack, and ship", "text": "Workers scan each unit off the shelf, pack it, and print a carrier label. The ship confirmation carries the tracking number back to the OMS, which marks the shipment shipped and tells the sales channel." },
+    { "step": 6, "title": "Push new stock levels out", "text": "Every pick, receipt, and adjustment is an event. The inventory service recalculates ATP and the channel sync pushes new quantities to the web store at once and to marketplaces within their API rate limits, usually within 1 to 15 minutes." },
+    { "step": 7, "title": "Count and reconcile", "text": "Warehouses cycle-count a slice of bin locations every day. Differences between the shelf and the system post as adjustments, so the inventory service never drifts far from what is physically there." },
+    { "step": 8, "title": "Returns re-enter stock", "text": "An approved return (RMA) gets a prepaid label. When the parcel is scanned in, the unit is graded: sellable units go back to available stock, damaged ones go to quarantine or liquidation, and the refund is triggered." }
+  ],
+  "nodes": [
+    {
+      "id": "channels",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Sales Channels (Web, Marketplaces, POS)",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Web store checkout", "Amazon SP-API", "Shopify POS"],
+        "io": {
+          "input": [
+            { "name": "Order status", "type": "JSON: { channelOrderId, status: \"shipped\", carrier, trackingNumber }" },
+            { "name": "Stock feed", "type": "JSON: [{ sku, quantity: 12, fulfillmentChannel: \"MERCHANT\" }]" }
+          ],
+          "output": [{ "name": "New order", "type": "JSON: { channel: \"amazon\", channelOrderId, lines: [{ sku, qty }], shipTo, paid: true }" }]
+        },
+        "responsibilities": [
+          "Takes paid orders: the web store via the checkout system, marketplaces via their order APIs, stores via POS.",
+          "Shows customers the quantity they are allowed to buy, which is only as fresh as the last stock feed.",
+          "Receives shipment and tracking updates; marketplaces penalise sellers who confirm shipment late."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Overselling across channels because of sync lag",
+            "impact": "The last unit sells on the web store and on Amazon in the same minute; one order must be cancelled, which hurts marketplace seller metrics.",
+            "mitigation": "Publish ATP minus a per-channel buffer (for example, hide the last 2 units on marketplaces) and push changes on low stock first."
+          },
+          {
+            "scenario": "Marketplace order poll misses or repeats orders",
+            "impact": "Orders are never shipped, or shipped twice.",
+            "mitigation": "Poll by last-updated time with overlap and deduplicate on (channel, channelOrderId) in the OMS."
+          }
+        ]
+      }
+    },
+    {
+      "id": "oms",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Order Management System (OMS)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Java / Kotlin service", "Postgres", "Kafka"],
+        "io": {
+          "input": [
+            { "name": "New order", "type": "JSON: { channel, channelOrderId, lines[], shipTo }" },
+            { "name": "Ship confirmation", "type": "Event: shipment.shipped { shipmentId, lines[], trackingNumber }" }
+          ],
+          "output": [
+            { "name": "Sourcing request", "type": "JSON: { orderId, lines: [{ sku, qty }], shipTo, serviceLevel: \"standard\" }" },
+            { "name": "Fulfilment order", "type": "JSON: { shipmentId, nodeId: \"DC-RENO\", lines[], carrierService }" }
+          ]
+        },
+        "responsibilities": [
+          "Runs one state machine per order: created → allocated → released → shipped → delivered, with cancelled, backordered, and returned branches.",
+          "Splits an order into shipments, one per fulfilling location, and tracks each shipment separately.",
+          "Releases reservations on cancel or timeout, and retries allocation for backordered lines when stock arrives."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cancel arrives after the warehouse has started picking",
+            "impact": "The parcel ships anyway and the customer is refunded for goods they received.",
+            "mitigation": "Cancel is a request to the WMS, not a state flip; honour it only until the pick is packed, otherwise intercept with the carrier."
+          },
+          {
+            "scenario": "Orders stuck between states after a partial failure",
+            "impact": "Paid orders sit unallocated and miss their ship-by date.",
+            "mitigation": "Outbox pattern for state changes plus an SLA monitor that alerts on orders older than N hours in any state."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sourcing",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Sourcing & Allocation Engine",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Rules + cost optimiser", "Rate tables / zone maps", "Redis cache"],
+        "io": {
+          "input": [{ "name": "Sourcing request", "type": "JSON: { orderId, lines: [{ sku, qty }], shipTo: { zip: \"98101\" } }" }],
+          "output": [{ "name": "Allocation plan", "type": "JSON: { shipments: [{ nodeId: \"DC-RENO\", lines[], estCost: 7.40, eta: \"2d\" }] }" }]
+        },
+        "responsibilities": [
+          "Scores every location with enough ATP by shipping zone, cost per package, labour capacity, and promised delivery date.",
+          "Prefers one shipment over several unless splitting is the only way to meet the delivery promise.",
+          "Respects node rules: stores ship only full-price items, a location over its daily capacity is skipped."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Sourcing engine down or slow",
+            "impact": "Orders can't be allocated and queue up in the OMS.",
+            "mitigation": "Fall back to a simple rule (nearest warehouse with stock) and re-optimise later if needed."
+          },
+          {
+            "scenario": "Plan built on stale ATP from cache",
+            "impact": "The reservation fails at the chosen location and the order bounces.",
+            "mitigation": "Treat the plan as a proposal; the reservation is the real check, and a failure triggers a re-plan with fresh numbers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "inventory",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Inventory Service (ATP & Reservations)",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres (row per SKU × location)", "Kafka", "Redis (ATP read cache)"],
+        "io": {
+          "input": [
+            { "name": "Reserve", "type": "JSON: { orderId, sku, nodeId, qty: 1, ttl: \"30m\" }" },
+            { "name": "Stock events", "type": "Event: { type: \"picked\" | \"received\" | \"adjusted\", sku, nodeId, delta }" }
+          ],
+          "output": [
+            { "name": "ATP", "type": "JSON: { sku, nodeId, onHand: 40, reserved: 6, safetyStock: 4, atp: 30 }" },
+            { "name": "ATP changed", "type": "Event: inventory.atp_changed { sku, nodeId, atp, networkAtp }" }
+          ]
+        },
+        "responsibilities": [
+          "Source of truth for stock per SKU per location: on hand, reserved, and ATP = on hand − reserved − safety stock.",
+          "Reserves with an atomic conditional update (UPDATE … SET reserved = reserved + 1 WHERE on_hand − reserved − safety ≥ 1), keyed by order line so retries are idempotent.",
+          "Applies warehouse events in order per SKU and location, and publishes the new ATP for channels."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Double allocation race on the last unit",
+            "impact": "Two orders both think they have the unit; one ships late or is cancelled.",
+            "mitigation": "Never read-then-write ATP; use the conditional update or a row lock, and reject the loser so it re-sources."
+          },
+          {
+            "scenario": "Ghost inventory: the system says 3, the shelf is empty",
+            "impact": "Orders are allocated, pickers find nothing, and orders short-ship.",
+            "mitigation": "A short-pick zeroes the bin and triggers a count; safety stock per SKU absorbs typical error."
+          },
+          {
+            "scenario": "Hot SKU during a flash sale",
+            "impact": "Thousands of reservations contend on one row and latency spikes.",
+            "mitigation": "Split the hot SKU's stock into several bucket rows, or pre-allocate quantity to each channel."
+          }
+        ]
+      }
+    },
+    {
+      "id": "channel-sync",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Channel Stock Sync",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka consumers", "Amazon SP-API Feeds", "Token-bucket rate limiter"],
+        "io": {
+          "input": [{ "name": "ATP changed", "type": "Event: inventory.atp_changed { sku, networkAtp }" }],
+          "output": [{ "name": "Stock feed", "type": "Marketplace feed: [{ sku, quantity }] / Shopify inventory_levels/set" }]
+        },
+        "responsibilities": [
+          "Turns ATP changes into per-channel quantities: network ATP minus each channel's buffer, capped by any allocation limit.",
+          "Coalesces many changes to one SKU into a single update and sends them in batches each channel's API allows.",
+          "Runs a full catalog resync nightly to repair anything the incremental updates missed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Marketplace API rate limit during a sale",
+            "impact": "Stock updates queue for 10+ minutes and the marketplace keeps selling sold-out items.",
+            "mitigation": "Prioritise updates by risk (items near zero first), coalesce per SKU, and keep larger buffers on rate-limited channels."
+          },
+          {
+            "scenario": "Sync consumer down for hours",
+            "impact": "Channels show yesterday's stock; overselling or missed sales.",
+            "mitigation": "Consumer lag alert; on recovery, replay from the last committed offset rather than resending everything."
+          }
+        ]
+      }
+    },
+    {
+      "id": "wms",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Warehouse Management System (WMS)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Manhattan / Blue Yonder WMS", "RF handheld scanners", "Pack-station label printers"],
+        "io": {
+          "input": [{ "name": "Fulfilment order", "type": "JSON: { shipmentId, lines: [{ sku, qty }], carrierService }" }],
+          "output": [
+            { "name": "Ship confirmation", "type": "Event: shipment.shipped { shipmentId, trackingNumber, weightKg }" },
+            { "name": "Stock adjustments", "type": "Event: { type: \"picked\" | \"received\" | \"cycle_count\", sku, bin, delta }" }
+          ]
+        },
+        "responsibilities": [
+          "Groups released orders into pick waves, directs workers to bins, and verifies every unit by barcode scan.",
+          "Owns physical stock by bin location and reports every receipt, pick, move, and count as an event.",
+          "Runs daily cycle counts so each bin is counted several times a year without stopping operations."
+        ],
+        "failureModes": [
+          {
+            "scenario": "A warehouse goes offline (network or power)",
+            "impact": "Released orders stall and stock events stop, so its ATP looks better than it is.",
+            "mitigation": "Mark the node unavailable in sourcing after a heartbeat timeout, re-source unreleased orders, and buffer events locally for replay."
+          },
+          {
+            "scenario": "Stock drift between WMS and inventory service",
+            "impact": "Lost or duplicated events make the two totals disagree, causing oversells or hidden stock.",
+            "mitigation": "Nightly snapshot reconciliation per SKU and location; differences post as explicit adjustment events with a reason code."
+          }
+        ]
+      }
+    },
+    {
+      "id": "carrier",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Carrier & Shipping Integration",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["UPS / FedEx / USPS APIs", "EasyPost / ShipEngine", "Tracking webhooks"],
+        "io": {
+          "input": [{ "name": "Label request", "type": "JSON: { fromNode, toAddress, parcel: { weightKg, dims }, service: \"ground\" }" }],
+          "output": [
+            { "name": "Label", "type": "JSON: { trackingNumber, labelZpl, rate: 8.15 }" },
+            { "name": "Tracking events", "type": "Webhook: { trackingNumber, status: \"in_transit\" | \"delivered\" }" }
+          ]
+        },
+        "responsibilities": [
+          "Rate-shops carriers per parcel and returns a label and tracking number in under a second.",
+          "Sends tracking updates through delivery, and generates prepaid return labels."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Carrier API outage at end of shift",
+            "impact": "Packed parcels can't get labels and miss the truck.",
+            "mitigation": "Fail over to a second carrier, or print pre-allocated label numbers offline and upload manifests later."
+          },
+          {
+            "scenario": "Address validation fails",
+            "impact": "Parcels are returned to sender days later.",
+            "mitigation": "Validate addresses when the order is created, not at the pack station."
+          }
+        ]
+      }
+    },
+    {
+      "id": "returns",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Returns (RMA) Processing",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Returns portal (Loop / Narvar)", "Grading workstations", "OMS refund API"],
+        "io": {
+          "input": [{ "name": "Inbound return", "type": "Scan: { rmaId, trackingNumber, sku, condition: \"A\" | \"B\" | \"damaged\" }" }],
+          "output": [{ "name": "Disposition", "type": "Event: return.received { sku, nodeId, qty, disposition: \"restock\" | \"quarantine\" }" }]
+        },
+        "responsibilities": [
+          "Authorises returns against policy (return window, final-sale items) and issues an RMA with a prepaid label.",
+          "Grades each unit on arrival and only returns sellable units to available stock, triggering the refund."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Returned units restocked without inspection",
+            "impact": "Damaged or wrong items are sold again, causing more returns.",
+            "mitigation": "Units enter a non-sellable 'received' status until graded; ATP excludes them."
+          },
+          {
+            "scenario": "Refund issued before the parcel arrives",
+            "impact": "Return fraud: empty boxes or swapped items.",
+            "mitigation": "Refund on carrier first scan only for trusted customers; otherwise refund after grading."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-channels-oms", "source": "channels", "sourceHandle": "r", "target": "oms", "targetHandle": "l", "data": { "flow": "orders", "payload": "new order ⇄ status + tracking", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-oms-sourcing", "source": "oms", "sourceHandle": "r", "target": "sourcing", "targetHandle": "l", "data": { "flow": "allocation", "payload": "source lines ⇄ allocation plan", "steps": [2, 3], "bidirectional": true } },
+    { "id": "e-sourcing-inventory", "source": "sourcing", "sourceHandle": "b", "target": "inventory", "targetHandle": "t", "data": { "flow": "allocation", "payload": "ATP per node ⇄ reserve", "steps": [2, 3], "bidirectional": true } },
+    { "id": "e-oms-wms", "source": "oms", "sourceHandle": "t", "target": "wms", "targetHandle": "t", "data": { "flow": "fulfilment", "payload": "release ⇄ ship confirmation", "steps": [4, 5], "bidirectional": true } },
+    { "id": "e-wms-carrier", "source": "wms", "sourceHandle": "r", "target": "carrier", "targetHandle": "l", "data": { "flow": "fulfilment", "payload": "rate + label ⇄ tracking", "steps": [5], "bidirectional": true } },
+    { "id": "e-wms-inventory", "source": "wms", "sourceHandle": "b", "target": "inventory", "targetHandle": "r", "data": { "flow": "stock", "payload": "picked / received / counted", "steps": [6, 7] } },
+    { "id": "e-inventory-sync", "source": "inventory", "sourceHandle": "l", "target": "channel-sync", "targetHandle": "r", "data": { "flow": "stock", "payload": "inventory.atp_changed", "steps": [6] } },
+    { "id": "e-sync-channels", "source": "channel-sync", "sourceHandle": "l", "target": "channels", "targetHandle": "b", "data": { "flow": "feeds", "payload": "stock feed (minus buffer)", "steps": [6] } },
+    { "id": "e-carrier-returns", "source": "carrier", "sourceHandle": "b", "target": "returns", "targetHandle": "t", "data": { "flow": "returns", "payload": "return label ⇄ inbound scan", "steps": [8], "bidirectional": true } },
+    { "id": "e-returns-inventory", "source": "returns", "sourceHandle": "b", "target": "inventory", "targetHandle": "b", "data": { "flow": "returns", "payload": "restock | quarantine", "steps": [8] } }
+  ]
+}
