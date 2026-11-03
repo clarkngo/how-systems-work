@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 1,
+  "id": "ride-hailing",
+  "title": "Ride-Hailing Dispatch",
+  "summary": "Ride-hailing is a real-time matching problem on a moving map. Millions of drivers report their location every few seconds into a geospatial index. When a rider requests a trip, the system prices it from local supply and demand, finds nearby drivers ranked by real road ETA, offers the trip to one at a time, and tracks it through a strict state machine until payment.",
+  "flows": {
+    "location": { "label": "Location updates", "color": "#34d399" },
+    "request": { "label": "Ride request & match", "color": "#38bdf8" },
+    "trip": { "label": "Trip lifecycle", "color": "#fbbf24" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Drivers stream locations", "text": "Every online driver's app sends GPS every ~4 seconds over a persistent connection. The location index stores each driver in an H3 hexagon cell, overwriting the previous position." },
+    { "step": 2, "title": "Rider requests a quote", "text": "The rider enters a destination. Pricing compares open requests with available drivers in the pickup cell, applies a surge multiplier, and returns a fare and ETA that are honoured for a few minutes." },
+    { "step": 3, "title": "Find nearby drivers", "text": "Dispatch searches the pickup cell and its neighbouring rings for available drivers, then ranks them by real road ETA rather than straight-line distance." },
+    { "step": 4, "title": "Create the trip and offer it", "text": "A trip record is created in REQUESTED state and the offer is pushed to the best driver with a 15-second timeout." },
+    { "step": 5, "title": "Driver accepts", "text": "If the driver accepts, the trip moves to ACCEPTED using a conditional write, so two drivers cannot both win. On timeout or decline, the next driver is offered." },
+    { "step": 6, "title": "Track the trip", "text": "The trip advances EN_ROUTE → ARRIVED → ON_TRIP → COMPLETED. The rider sees the car move from the same location stream." },
+    { "step": 7, "title": "Charge and pay out", "text": "On completion the final fare is computed from the route, the rider's card is charged, and the driver's earnings are recorded for payout." }
+  ],
+  "nodes": [
+    {
+      "id": "rider",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Rider App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android", "WebSocket"],
+        "io": {
+          "input": [{ "name": "Updates", "type": "Quote, driver assigned, live car position, receipt" }],
+          "output": [{ "name": "Request", "type": "{ pickup: lat/lng, dropoff, product: 'X', quoteId }" }]
+        },
+        "responsibilities": [
+          "Requests quotes and rides, and shows the driver approaching.",
+          "Keeps a persistent connection for live updates.",
+          "Retries requests with the same request ID after network drops."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Rider taps 'Request' twice on a bad network",
+            "impact": "Two trips, two drivers dispatched.",
+            "mitigation": "Client-generated request ID; server deduplicates."
+          },
+          {
+            "scenario": "Connection drops mid-trip",
+            "impact": "The rider sees a frozen map.",
+            "mitigation": "Reconnect and fetch current trip state; push notifications for key transitions."
+          }
+        ]
+      }
+    },
+    {
+      "id": "driver",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Driver App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["GPS + sensor fusion", "Persistent connection"],
+        "io": {
+          "input": [{ "name": "Offer", "type": "{ tripId, pickup, eta, fare, expiresIn: 15s }" }],
+          "output": [{ "name": "Location", "type": "{ driverId, lat, lng, heading, speed, ts } every ~4 s" }]
+        },
+        "responsibilities": [
+          "Streams location while online and reports status changes.",
+          "Accepts or declines offers before they expire.",
+          "Advances the trip: arrived, started, completed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "GPS jumps in urban canyons",
+            "impact": "The driver appears on the wrong street; ETAs are wrong.",
+            "mitigation": "Snap to the road map with filtering; ignore implausible jumps."
+          },
+          {
+            "scenario": "Driver loses signal after accepting",
+            "impact": "Rider waits for a car that will not come.",
+            "mitigation": "Heartbeat timeout triggers reassignment and notifies the rider."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Realtime Gateway",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["WebSocket / gRPC streams", "Edge PoPs"],
+        "io": {
+          "input": [{ "name": "Client traffic", "type": "Location pings, ride requests, offer responses" }],
+          "output": [{ "name": "Routed calls", "type": "To location, pricing, and dispatch services; pushes back to apps" }]
+        },
+        "responsibilities": [
+          "Holds millions of long-lived connections from riders and drivers.",
+          "Routes location writes, quotes, and dispatch calls to the right city's services.",
+          "Pushes offers and trip updates to the right device in under a second."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Gateway node dies",
+            "impact": "Thousands of drivers disconnect at once.",
+            "mitigation": "Clients reconnect with jittered backoff to another node; state lives outside the gateway."
+          },
+          {
+            "scenario": "Location pings overwhelm downstream",
+            "impact": "Index writes lag; positions are stale.",
+            "mitigation": "Drop superseded pings; reduce ping rate for idle drivers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "location",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Geospatial Index",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Redis (in memory)", "H3 hexagon cells"],
+        "io": {
+          "input": [{ "name": "Upsert", "type": "driver → H3 cell (res 9, ~0.1 km²) + status" }],
+          "output": [{ "name": "Nearby", "type": "Available drivers in k-ring of cells around pickup" }]
+        },
+        "responsibilities": [
+          "Keeps only the latest position of each driver; old points expire.",
+          "Answers 'who is near here?' by looking up a cell and its neighbours.",
+          "Aggregates supply per cell for pricing."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Index shard for a dense city overloaded",
+            "impact": "Matching slows down in that city.",
+            "mitigation": "Shard by city and cell; replicas for reads."
+          },
+          {
+            "scenario": "Stale entries for drivers who went offline",
+            "impact": "Offers sent to phantom drivers.",
+            "mitigation": "TTL on entries; refreshed by each ping."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pricing",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Pricing & Surge",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Stream aggregation", "ETA / route service"],
+        "io": {
+          "input": [{ "name": "Quote request", "type": "pickup, dropoff, product + supply/demand per cell" }],
+          "output": [{ "name": "Quote", "type": "{ quoteId, fare: $18.40, surge: 1.4×, expiresAt }" }]
+        },
+        "responsibilities": [
+          "Estimates the fare from predicted route distance and time.",
+          "Raises prices where demand exceeds supply, to attract drivers and ration demand.",
+          "Locks a quote so the rider pays what they were shown."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Surge oscillates between neighbouring cells",
+            "impact": "Drivers chase surge back and forth; riders are confused.",
+            "mitigation": "Smooth over time and space; cap how fast the multiplier changes."
+          },
+          {
+            "scenario": "Pricing service down",
+            "impact": "No quotes, so no rides.",
+            "mitigation": "Fall back to base fare without surge; never block the request on surge."
+          }
+        ]
+      }
+    },
+    {
+      "id": "matching",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Dispatch / Matching",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Per-city dispatch workers", "Batch matching"],
+        "io": {
+          "input": [{ "name": "Ride request", "type": "{ riderId, pickup, product, quoteId }" }],
+          "output": [{ "name": "Assignment", "type": "Offer to driver, then trip ACCEPTED with driverId" }]
+        },
+        "responsibilities": [
+          "Ranks nearby drivers by road ETA, rating, and vehicle type.",
+          "Batches requests for a second or two to optimise matches across the whole area.",
+          "Offers to one driver at a time, then falls through on timeout or decline."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Same driver offered two trips at once",
+            "impact": "One rider is left stranded.",
+            "mitigation": "Reserve the driver with an atomic lock before sending an offer."
+          },
+          {
+            "scenario": "No drivers nearby",
+            "impact": "Long waits or failed requests.",
+            "mitigation": "Widen the search radius step by step; show an honest ETA or 'no cars available'."
+          }
+        ]
+      }
+    },
+    {
+      "id": "trips",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Trip State Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Cassandra / Spanner", "Conditional writes"],
+        "io": {
+          "input": [{ "name": "Transition", "type": "UPDATE state=ACCEPTED IF state=REQUESTED" }],
+          "output": [{ "name": "Trip", "type": "{ tripId, state, riderId, driverId, route, fare }" }]
+        },
+        "responsibilities": [
+          "Enforces legal state transitions so a trip cannot be accepted twice or completed before it starts.",
+          "Records timestamps and the route for fare calculation and disputes.",
+          "Emits trip events for payments, receipts, and analytics."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Two drivers accept the same trip",
+            "impact": "Two cars arrive for one rider.",
+            "mitigation": "Compare-and-set on state; the loser gets 'trip no longer available'."
+          },
+          {
+            "scenario": "Trip stuck in ON_TRIP (app crash)",
+            "impact": "No charge, no payout, driver unavailable.",
+            "mitigation": "Timeouts with automatic completion from GPS evidence; ops review queue."
+          }
+        ]
+      }
+    },
+    {
+      "id": "payments",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Payments & Payouts",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["Payment gateway", "Ledger"],
+        "io": {
+          "input": [{ "name": "TripCompleted", "type": "{ tripId, finalFare, tip, driverId }" }],
+          "output": [{ "name": "Settlement", "type": "Rider charged; driver earnings credited for weekly or instant payout" }]
+        },
+        "responsibilities": [
+          "Authorises the card at request time and captures the final fare at the end.",
+          "Splits the fare into driver earnings, platform fee, and taxes.",
+          "Handles refunds for cancellations and disputes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Card declined after the trip",
+            "impact": "The platform still owes the driver.",
+            "mitigation": "Pre-authorise at request time; retry, then require a new card before the next ride."
+          },
+          {
+            "scenario": "Duplicate capture on retry",
+            "impact": "Rider charged twice.",
+            "mitigation": "Idempotency key per trip on capture calls."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-driver-gateway", "source": "driver", "sourceHandle": "r", "target": "gateway", "targetHandle": "b", "data": { "flow": "location", "payload": "GPS every 4 s ⇄ offers", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-rider-gateway", "source": "rider", "sourceHandle": "r", "target": "gateway", "targetHandle": "t", "data": { "flow": "request", "payload": "quote / request ⇄ live updates", "steps": [2, 6], "bidirectional": true } },
+    { "id": "e-gateway-location", "source": "gateway", "sourceHandle": "t", "target": "location", "targetHandle": "l", "data": { "flow": "location", "payload": "upsert H3 cell", "steps": [1] } },
+    { "id": "e-gateway-pricing", "source": "gateway", "sourceHandle": "b", "target": "pricing", "targetHandle": "l", "data": { "flow": "request", "payload": "fare + surge (supply per cell)", "steps": [2], "bidirectional": true } },
+    { "id": "e-gateway-matching", "source": "gateway", "sourceHandle": "r", "target": "matching", "targetHandle": "l", "data": { "flow": "request", "payload": "dispatch ⇄ offer / accept", "steps": [3, 5], "bidirectional": true } },
+    { "id": "e-matching-location", "source": "matching", "sourceHandle": "t", "target": "location", "targetHandle": "r", "data": { "flow": "request", "payload": "nearby drivers (k-ring)", "steps": [3], "bidirectional": true } },
+    { "id": "e-matching-trips", "source": "matching", "sourceHandle": "r", "target": "trips", "targetHandle": "l", "data": { "flow": "trip", "payload": "REQUESTED → ACCEPTED → …", "steps": [4, 5, 6] } },
+    { "id": "e-trips-payments", "source": "trips", "sourceHandle": "b", "target": "payments", "targetHandle": "t", "data": { "flow": "trip", "payload": "TripCompleted", "steps": [7] } }
+  ]
+}

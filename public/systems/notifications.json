@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "id": "notifications",
+  "title": "Notification System",
+  "summary": "A notification system turns product events (\"your order shipped\", \"Sam replied\") into push, email, and SMS messages without spamming people. It checks each user's preferences and quiet hours, queues work by channel and priority, delivers through third-party providers with retries, and uses delivery and bounce feedback to clean up bad addresses and tokens.",
+  "flows": {
+    "events": { "label": "Trigger events", "color": "#38bdf8" },
+    "lookup": { "label": "Preference lookup", "color": "#fbbf24" },
+    "delivery": { "label": "Delivery", "color": "#34d399" },
+    "feedback": { "label": "Delivery feedback", "color": "#f472b6", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Product emits an event", "text": "A service calls the notification API: notify user 42 with template order_shipped and some data. An idempotency key makes retries safe." },
+    { "step": 2, "title": "Check preferences", "text": "The API loads the user's opt-ins per category and channel, quiet hours, time zone, and device tokens. Marketing to an opted-out user stops here; a security alert is always sent." },
+    { "step": 3, "title": "Enqueue per channel", "text": "Each delivery is rendered from its template and placed on a channel queue (push, email, SMS) with a priority. A password reset never waits behind a newsletter." },
+    { "step": 4, "title": "Workers pick up jobs", "text": "Channel workers pull jobs at the rate each provider allows, batch low-priority messages into digests, and deduplicate repeats." },
+    { "step": 5, "title": "Send via providers", "text": "Workers call APNs or FCM for push, SES or SendGrid for email, Twilio for SMS. Transient failures retry with backoff; permanent ones go to a dead-letter queue." },
+    { "step": 6, "title": "Collect delivery feedback", "text": "Providers report delivered, bounced, unsubscribed, or invalid token through webhooks. Opens and clicks are tracked too." },
+    { "step": 7, "title": "Clean up targets", "text": "Hard-bounced emails, dead device tokens, and spam complaints update the preference store, so the next send skips them and sender reputation stays healthy." }
+  ],
+  "nodes": [
+    {
+      "id": "producers",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Product Services",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Orders, Social, Security services"],
+        "io": {
+          "input": [{ "name": "Domain event", "type": "OrderShipped, CommentAdded, NewLogin" }],
+          "output": [{ "name": "Notify request", "type": "{ userId, template, data, category, idempotencyKey }" }]
+        },
+        "responsibilities": [
+          "Decides that something happened worth telling a user about.",
+          "Sends intent (template + data), not finished emails or push payloads.",
+          "Tags each notification with a category such as transactional, social, or marketing."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Event replayed after a bug fix",
+            "impact": "Users get the same notification twice, or ten times.",
+            "mitigation": "Idempotency key per logical notification, deduplicated at the API."
+          },
+          {
+            "scenario": "Bulk job emits a million events at once",
+            "impact": "Queues flood and urgent messages are delayed.",
+            "mitigation": "Separate bulk lanes and per-producer quotas."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Notification API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["REST / gRPC", "Template engine"],
+        "io": {
+          "input": [{ "name": "Notify request", "type": "POST /notify + idempotency key" }],
+          "output": [
+            { "name": "Pref lookup", "type": "GET prefs(userId, category)" },
+            { "name": "Jobs", "type": "{ channel, to, renderedBody, priority, sendAt }" }
+          ]
+        },
+        "responsibilities": [
+          "Validates, deduplicates, and decides which channels each notification goes to.",
+          "Renders localised templates per channel (push title, email HTML, 160-character SMS).",
+          "Applies quiet hours and per-user frequency caps by scheduling sends for later."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Preference store slow",
+            "impact": "Every notification is delayed behind the lookup.",
+            "mitigation": "Cache preferences; if lookup fails, send transactional messages and defer marketing ones."
+          },
+          {
+            "scenario": "Template bug renders blank or {{name}}",
+            "impact": "Embarrassing messages sent to millions.",
+            "mitigation": "Template tests with sample data, staged rollout, and sending to internal users first."
+          }
+        ]
+      }
+    },
+    {
+      "id": "prefs",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Preferences & Targets",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["DynamoDB / Postgres", "Redis cache"],
+        "io": {
+          "input": [{ "name": "Updates", "type": "Settings changes, unsubscribes, invalidated tokens" }],
+          "output": [{ "name": "Profile", "type": "{ optIns, quietHours, tz, emails, pushTokens[] }" }]
+        },
+        "responsibilities": [
+          "Stores what each user wants per category and channel: the source of truth for consent.",
+          "Keeps device tokens, verified emails, and phone numbers.",
+          "Records unsubscribes immediately, as laws like CAN-SPAM and GDPR require."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Unsubscribe not honoured",
+            "impact": "Legal exposure, spam complaints, damaged sender reputation.",
+            "mitigation": "Synchronous write on unsubscribe, checked at send time and not only at enqueue time."
+          },
+          {
+            "scenario": "Stale device tokens pile up",
+            "impact": "Wasted sends, and providers may throttle you.",
+            "mitigation": "Remove tokens that providers report as invalid."
+          }
+        ]
+      }
+    },
+    {
+      "id": "queue",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Channel Queues",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Kafka / SQS", "Priority lanes", "Delay queues"],
+        "io": {
+          "input": [{ "name": "Jobs", "type": "One per (user, channel), keyed by userId" }],
+          "output": [{ "name": "Batches", "type": "Per-channel, per-priority streams" }]
+        },
+        "responsibilities": [
+          "Buffers bursts so providers receive a steady rate.",
+          "Separates urgent (OTP, security) from bulk (digest, marketing) traffic.",
+          "Holds delayed jobs for quiet hours and scheduled sends."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Backlog from a marketing blast",
+            "impact": "OTP codes arrive after they expire.",
+            "mitigation": "Dedicated high-priority queues and workers that bulk traffic cannot use."
+          },
+          {
+            "scenario": "Poison message crashes workers",
+            "impact": "That partition stops delivering.",
+            "mitigation": "Retry limit, then dead-letter queue with alerting."
+          }
+        ]
+      }
+    },
+    {
+      "id": "workers",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Delivery Workers",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Per-channel worker pools", "Rate limiters"],
+        "io": {
+          "input": [{ "name": "Jobs", "type": "Rendered messages from channel queues" }],
+          "output": [{ "name": "Provider calls", "type": "APNs HTTP/2, FCM v1, SES SendEmail, Twilio Messages" }]
+        },
+        "responsibilities": [
+          "Sends at each provider's allowed rate and retries transient errors with backoff.",
+          "Collapses multiple notifications into digests (\"5 new comments\").",
+          "Fails over to a backup provider when the primary degrades."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retry after a timeout that actually succeeded",
+            "impact": "Duplicate SMS, which also costs money.",
+            "mitigation": "Pass idempotency keys to providers that support them; record each send before retrying."
+          },
+          {
+            "scenario": "Provider throttles you",
+            "impact": "Sends fail and queues back up.",
+            "mitigation": "Adaptive rate limiting driven by provider responses; secondary provider for SMS and email."
+          }
+        ]
+      }
+    },
+    {
+      "id": "providers",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Channel Providers",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["APNs / FCM", "SES / SendGrid", "Twilio"],
+        "io": {
+          "input": [{ "name": "Send", "type": "Push payload, MIME email, SMS body" }],
+          "output": [{ "name": "Webhooks", "type": "delivered / bounced / complained / invalid_token" }]
+        },
+        "responsibilities": [
+          "Deliver to the device, the inbox, or the carrier network.",
+          "Enforce their own rate limits, content rules, and sender reputation.",
+          "Report delivery results asynchronously."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Email domain lands in spam folders",
+            "impact": "Password resets never seen.",
+            "mitigation": "SPF/DKIM/DMARC, a separate sending domain for marketing, and fast bounce suppression."
+          },
+          {
+            "scenario": "SMS blocked by a carrier",
+            "impact": "OTPs fail in one country.",
+            "mitigation": "Registered sender IDs, per-country routing, and fallback to voice or another provider."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tracking",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Delivery Tracking",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Webhook ingest", "Event store"],
+        "io": {
+          "input": [{ "name": "Provider events", "type": "Webhooks + open/click pixels" }],
+          "output": [{ "name": "Updates", "type": "Suppress email, drop token, delivery status" }]
+        },
+        "responsibilities": [
+          "Records each notification's lifecycle: sent, delivered, opened, clicked.",
+          "Suppresses hard bounces and spam complaints immediately.",
+          "Measures delivery rate per channel and provider for alerting."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Webhooks dropped during a spike",
+            "impact": "Bounced addresses keep receiving mail; reputation falls.",
+            "mitigation": "Queue webhooks durably on receipt; reconcile with provider suppression lists."
+          },
+          {
+            "scenario": "Open tracking blocked by mail privacy features",
+            "impact": "Open rates look wrong.",
+            "mitigation": "Use clicks and conversions as the main engagement signal."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-producers-api", "source": "producers", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "events", "payload": "notify(userId, template)", "steps": [1] } },
+    { "id": "e-api-prefs", "source": "api", "sourceHandle": "t", "target": "prefs", "targetHandle": "l", "data": { "flow": "lookup", "payload": "opt-ins, quiet hours, tokens", "steps": [2], "bidirectional": true } },
+    { "id": "e-api-queue", "source": "api", "sourceHandle": "b", "target": "queue", "targetHandle": "l", "data": { "flow": "delivery", "payload": "rendered jobs by priority", "steps": [3] } },
+    { "id": "e-queue-workers", "source": "queue", "sourceHandle": "r", "target": "workers", "targetHandle": "l", "data": { "flow": "delivery", "payload": "pull at provider rate", "steps": [4] } },
+    { "id": "e-workers-providers", "source": "workers", "sourceHandle": "r", "target": "providers", "targetHandle": "l", "data": { "flow": "delivery", "payload": "push / email / SMS", "steps": [5] } },
+    { "id": "e-providers-tracking", "source": "providers", "sourceHandle": "t", "target": "tracking", "targetHandle": "b", "data": { "flow": "feedback", "payload": "delivery webhooks", "steps": [6] } },
+    { "id": "e-tracking-prefs", "source": "tracking", "sourceHandle": "t", "target": "prefs", "targetHandle": "t", "data": { "flow": "feedback", "payload": "suppress bounces, drop tokens", "steps": [7] } }
+  ]
+}

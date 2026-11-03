@@ -1,0 +1,254 @@
+{
+  "schemaVersion": 1,
+  "id": "message-queue",
+  "title": "Message Queue",
+  "summary": "A message queue (here a Kafka-style log) separates the services that produce work from the services that do it. Producers append messages to partitioned, replicated logs. Consumers read at their own pace and record how far they have got. Because the log is durable and replicated, a consumer can crash, a broker can die, or traffic can spike tenfold without losing messages. The catch is that delivery is at-least-once, so consumers must handle duplicates.",
+  "flows": {
+    "produce": { "label": "Produce & replicate", "color": "#38bdf8" },
+    "consume": { "label": "Consume", "color": "#34d399" },
+    "control": { "label": "Failure handling & control", "color": "#f472b6", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Produce a message", "text": "The orders service sends OrderPlaced with key orderId. The key is hashed to choose a partition, so all events for one order stay in order on the same partition." },
+    { "step": 2, "title": "Leader appends to the log", "text": "The partition's leader broker appends the batch to the end of its on-disk log segment and assigns sequential offsets." },
+    { "step": 3, "title": "Replicate, then acknowledge", "text": "Follower brokers copy the new entries. With acks=all, the producer is acknowledged only after every in-sync replica has the message, so losing one broker loses nothing." },
+    { "step": 4, "title": "Consumers fetch", "text": "Each consumer in a group owns some partitions and pulls batches from its last committed offset. Adding consumers spreads partitions across more workers." },
+    { "step": 5, "title": "Process and commit", "text": "After processing a batch, the consumer commits its new offset. If it crashes before committing, another consumer re-reads those messages, so processing must be idempotent." },
+    { "step": 6, "title": "Retry, then dead-letter", "text": "A message that keeps failing, such as one with a malformed payload, is moved to a retry topic with delay and finally to a dead-letter topic, so it does not block the partition." },
+    { "step": 7, "title": "Broker fails: elect a new leader", "text": "The controller notices a broker missed heartbeats and promotes an in-sync follower to leader. Producers and consumers refresh metadata and continue." }
+  ],
+  "nodes": [
+    {
+      "id": "producers",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Producers",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Kafka client", "Idempotent producer"],
+        "io": {
+          "input": [{ "name": "Ack", "type": "{ partition: 7, offset: 918273 } or retriable error" }],
+          "output": [{ "name": "Record", "type": "topic=orders, key=orderId, value=OrderPlaced (Avro), headers" }]
+        },
+        "responsibilities": [
+          "Batch and compress records for throughput.",
+          "Choose the partition by key to preserve per-key ordering.",
+          "Retry safely: the idempotent producer adds sequence numbers so brokers drop duplicates."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hot key (one huge customer)",
+            "impact": "One partition is overloaded while others sit idle.",
+            "mitigation": "Better key choice, or salt the key when strict ordering is not needed."
+          },
+          {
+            "scenario": "Writing to DB and queue separately",
+            "impact": "DB commits but the publish fails, or the reverse; events are lost or phantom.",
+            "mitigation": "Transactional outbox: write the event to a DB table in the same transaction, then relay it."
+          }
+        ]
+      }
+    },
+    {
+      "id": "leader",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Partition Leader Broker",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Kafka broker", "Zero-copy sendfile"],
+        "io": {
+          "input": [{ "name": "Produce / fetch", "type": "ProduceRequest(batch) · FetchRequest(offset)" }],
+          "output": [{ "name": "Writes", "type": "Append to log + replicate to followers" }]
+        },
+        "responsibilities": [
+          "Handles all reads and writes for the partitions it leads.",
+          "Tracks which followers are in sync (the ISR) and the high-water mark.",
+          "Only exposes messages to consumers once they are fully replicated."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Broker disk fills up",
+            "impact": "Writes fail for all partitions on that broker.",
+            "mitigation": "Retention by time and size, disk alerts, and rebalancing partitions across brokers."
+          },
+          {
+            "scenario": "Unclean leader election",
+            "impact": "An out-of-sync replica becomes leader and committed messages are lost.",
+            "mitigation": "unclean.leader.election.enable=false, and min.insync.replicas=2."
+          }
+        ]
+      }
+    },
+    {
+      "id": "followers",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Follower Replicas",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Replication factor 3", "Spread across zones"],
+        "io": {
+          "input": [{ "name": "Replica fetch", "type": "Fetch from leader at my log end offset" }],
+          "output": [{ "name": "Copy", "type": "Identical log; reports position to leader" }]
+        },
+        "responsibilities": [
+          "Keep exact copies of the leader's log in other availability zones.",
+          "Stay in the ISR by keeping up within replica.lag.time.max.ms.",
+          "Stand ready to become leader instantly."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Follower falls behind",
+            "impact": "It leaves the ISR; durability drops to fewer copies.",
+            "mitigation": "Alert on under-replicated partitions; throttle bulk reassignments."
+          },
+          {
+            "scenario": "Whole zone outage",
+            "impact": "Replicas in that zone are gone.",
+            "mitigation": "Rack-aware placement: one replica per zone."
+          }
+        ]
+      }
+    },
+    {
+      "id": "log",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Partition Log",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Append-only segments", "Page cache"],
+        "io": {
+          "input": [{ "name": "Append", "type": "Record batches at increasing offsets" }],
+          "output": [{ "name": "Read", "type": "Sequential reads from any offset (replay possible)" }]
+        },
+        "responsibilities": [
+          "Stores messages in order per partition, appended sequentially for very high throughput.",
+          "Keeps messages after they are read, for days or forever, so consumers can replay.",
+          "Supports compaction: keep only the latest value per key for changelog topics."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retention shorter than consumer downtime",
+            "impact": "A consumer returns to find unread messages deleted.",
+            "mitigation": "Size retention to the worst-case outage and alert on consumer lag approaching it."
+          },
+          {
+            "scenario": "Too many partitions",
+            "impact": "Slow failover and high memory use.",
+            "mitigation": "Size partitions to target throughput, not 'just in case'."
+          }
+        ]
+      }
+    },
+    {
+      "id": "controller",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Controller (KRaft)",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Raft quorum", "Cluster metadata log"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Broker heartbeats, ISR changes, admin requests" }],
+          "output": [{ "name": "Metadata", "type": "Partition → leader, ISR, topic configs" }]
+        },
+        "responsibilities": [
+          "Elects partition leaders and handles broker failures.",
+          "Stores cluster metadata in a replicated Raft log.",
+          "Applies topic creation, partition increases, and config changes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Controller quorum loses majority",
+            "impact": "No leader changes or topic changes; existing traffic continues.",
+            "mitigation": "3 or 5 controller nodes across zones."
+          },
+          {
+            "scenario": "Flapping broker",
+            "impact": "Constant leader elections hurt latency.",
+            "mitigation": "Session timeouts tuned for the network; fence the unhealthy broker."
+          }
+        ]
+      }
+    },
+    {
+      "id": "consumers",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Consumer Group",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Group coordinator", "Cooperative rebalancing"],
+        "io": {
+          "input": [{ "name": "Batches", "type": "Records from assigned partitions" }],
+          "output": [{ "name": "Progress", "type": "Commit offsets to __consumer_offsets" }]
+        },
+        "responsibilities": [
+          "Split partitions among group members; each partition has one active consumer.",
+          "Process idempotently, because redelivery after a crash is normal.",
+          "Commit offsets only after side effects succeed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Consumer lag grows",
+            "impact": "Downstream work is delayed by minutes or hours.",
+            "mitigation": "Autoscale on lag, up to the partition count; optimise per-message cost."
+          },
+          {
+            "scenario": "Commit before processing",
+            "impact": "A crash loses messages (at-most-once).",
+            "mitigation": "Commit after processing; deduplicate with a processed-ID table."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dlq",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Retry & Dead-Letter Topics",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["orders.retry.5m", "orders.dlq"],
+        "io": {
+          "input": [{ "name": "Failed message", "type": "Original record + error + attempt count" }],
+          "output": [{ "name": "Triage", "type": "Delayed retries; DLQ alerts; replay tool" }]
+        },
+        "responsibilities": [
+          "Take failing messages out of the main partition so others keep flowing.",
+          "Retry later with increasing delay for transient failures.",
+          "Hold poison messages for humans to inspect, fix, and replay."
+        ],
+        "failureModes": [
+          {
+            "scenario": "DLQ fills silently",
+            "impact": "Orders quietly never get processed.",
+            "mitigation": "Alert on DLQ depth and age; own the DLQ like a support queue."
+          },
+          {
+            "scenario": "Retrying breaks ordering",
+            "impact": "A later update is applied before an earlier one.",
+            "mitigation": "Version checks in the consumer, or pause the key until its retry completes."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-producers-leader", "source": "producers", "sourceHandle": "r", "target": "leader", "targetHandle": "l", "data": { "flow": "produce", "payload": "produce(key) ⇄ ack", "steps": [1, 3], "bidirectional": true } },
+    { "id": "e-leader-log", "source": "leader", "sourceHandle": "b", "target": "log", "targetHandle": "l", "data": { "flow": "produce", "payload": "append at offset", "steps": [2] } },
+    { "id": "e-leader-followers", "source": "leader", "sourceHandle": "t", "target": "followers", "targetHandle": "l", "data": { "flow": "produce", "payload": "replicate (ISR)", "steps": [3] } },
+    { "id": "e-log-consumers", "source": "log", "sourceHandle": "r", "target": "consumers", "targetHandle": "l", "data": { "flow": "consume", "payload": "fetch ⇄ commit offset", "steps": [4, 5], "bidirectional": true } },
+    { "id": "e-consumers-dlq", "source": "consumers", "sourceHandle": "r", "target": "dlq", "targetHandle": "l", "data": { "flow": "control", "payload": "retry → dead-letter", "steps": [6] } },
+    { "id": "e-followers-controller", "source": "followers", "sourceHandle": "r", "target": "controller", "targetHandle": "l", "data": { "flow": "control", "payload": "heartbeats · elect new leader", "steps": [7], "bidirectional": true } }
+  ]
+}

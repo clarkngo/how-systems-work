@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "id": "recommendation-engine",
+  "title": "Recommendation Engine",
+  "summary": "A recommendation engine picks a handful of items out of millions in about 100 milliseconds. Scoring everything is too slow, so it works like a funnel. Cheap retrieval narrows millions of items to about a thousand candidates, a heavier model ranks those using fresh features, and business rules polish the final list. Every impression and click is logged and becomes training data for tomorrow's models.",
+  "flows": {
+    "serving": { "label": "Serving request", "color": "#38bdf8" },
+    "retrieval": { "label": "Retrieval & features", "color": "#a78bfa" },
+    "feedback": { "label": "Feedback & training", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Request recommendations", "text": "The app opens the home screen and asks for 20 items for user 42, with context like device, time of day, and the last item viewed." },
+    { "step": 2, "title": "Generate candidates", "text": "Several cheap retrievers run in parallel: an approximate-nearest-neighbour search over item embeddings near the user's embedding, 'because you watched X', and trending items. Together they return about 1,000 candidates." },
+    { "step": 3, "title": "Fetch features", "text": "The online feature store returns user features (recent clicks, preferences) and item features (CTR in the last hour, age, popularity) for every candidate." },
+    { "step": 4, "title": "Rank", "text": "A heavier model, such as a gradient-boosted tree or deep network, predicts each candidate's probability of click, watch, or purchase and combines them into one score." },
+    { "step": 5, "title": "Re-rank and filter", "text": "Business rules remove items already seen, out of stock, or blocked, add diversity so the page is not ten near-identical items, and blend in some exploration." },
+    { "step": 6, "title": "Return the page", "text": "The ranked list goes back to the app with a request ID, so every later click can be tied to exactly what was shown." },
+    { "step": 7, "title": "Log impressions and clicks", "text": "The app streams what was shown and what the user did. Items that were not clicked count as negative examples." },
+    { "step": 8, "title": "Retrain and refresh", "text": "Offline jobs join logged features with outcomes, retrain the models and embeddings, and publish new features and model versions after an A/B test." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Client App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Mobile / web", "Event SDK"],
+        "io": {
+          "input": [{ "name": "Recommendations", "type": "[{ itemId, score, reason }] + requestId" }],
+          "output": [
+            { "name": "Request", "type": "GET /recs?surface=home&n=20 + context" },
+            { "name": "Events", "type": "impression, click, watch_time, purchase" }
+          ]
+        },
+        "responsibilities": [
+          "Asks for recommendations per surface: home, 'more like this', email.",
+          "Logs exactly what was shown and in which position, not just clicks.",
+          "Shows a fallback (popular items) if the request is slow."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Impressions not logged",
+            "impact": "Models only see clicks, cannot learn what was ignored, and overrate popular items.",
+            "mitigation": "Log impressions on render with the requestId; monitor the click/impression join rate."
+          },
+          {
+            "scenario": "Recs service times out",
+            "impact": "An empty home screen.",
+            "mitigation": "Client deadline with cached or popular fallback lists."
+          }
+        ]
+      }
+    },
+    {
+      "id": "rec-api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Recommendation Service",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["gRPC orchestrator", "Per-stage deadlines"],
+        "io": {
+          "input": [{ "name": "Request", "type": "{ userId, surface, context, n }" }],
+          "output": [{ "name": "Ranked list", "type": "Top-n items with scores and explanations" }]
+        },
+        "responsibilities": [
+          "Runs the funnel: retrieve, fetch features, rank, re-rank, within a ~100 ms budget.",
+          "Calls retrievers in parallel and drops any that miss their deadline.",
+          "Logs the exact features used, so training data matches serving (no training/serving skew)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ranking model slow under load",
+            "impact": "p99 latency blows the page budget.",
+            "mitigation": "Rank fewer candidates under pressure; fall back to the retrieval order."
+          },
+          {
+            "scenario": "Cold-start user with no history",
+            "impact": "Personal retrievers return nothing.",
+            "mitigation": "Popular items in the user's locale plus onboarding questions; learn quickly from early clicks."
+          }
+        ]
+      }
+    },
+    {
+      "id": "candidates",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Candidate Retrieval",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Two-tower embeddings", "ANN index (FAISS / ScaNN)"],
+        "io": {
+          "input": [{ "name": "Query", "type": "User embedding (256-d) + recent items" }],
+          "output": [{ "name": "Candidates", "type": "~1,000 itemIds from several sources" }]
+        },
+        "responsibilities": [
+          "Finds items whose embeddings are close to the user's embedding in a few milliseconds.",
+          "Mixes sources (similar items, trending, followed creators) so no single signal dominates.",
+          "Keeps the index fresh so new items can appear within minutes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "New items have no embedding yet",
+            "impact": "Fresh content never gets recommended (item cold start).",
+            "mitigation": "Content-based embeddings from title, image, and text at upload; reserved exploration slots."
+          },
+          {
+            "scenario": "Filter bubble",
+            "impact": "Users only see more of the same and engagement slowly drops.",
+            "mitigation": "Diversity-aware retrieval sources and exploration traffic."
+          }
+        ]
+      }
+    },
+    {
+      "id": "features",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Online Feature Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Redis / Cassandra", "Feast / Tecton"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "Batch get: user 42 + 1,000 itemIds" }],
+          "output": [{ "name": "Features", "type": "{ user_ctr_7d, item_ctr_1h, item_age_h, … }" }]
+        },
+        "responsibilities": [
+          "Serves precomputed and streaming features with low latency.",
+          "Uses the same feature definitions offline and online, so the model sees consistent inputs.",
+          "Updates real-time signals like 'clicked in the last 5 minutes' from the event stream."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Feature pipeline stalls",
+            "impact": "Stale features; trending items are missed.",
+            "mitigation": "Freshness metrics per feature with alerts; models trained to tolerate missing values."
+          },
+          {
+            "scenario": "Training/serving skew",
+            "impact": "The model performs well offline but poorly in production.",
+            "mitigation": "Log the served features and train on those logs."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ranker",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Ranking & Re-ranking",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["GBDT / deep ranking model", "GPU or CPU inference"],
+        "io": {
+          "input": [{ "name": "Candidates + features", "type": "1,000 × ~500 feature vectors" }],
+          "output": [{ "name": "Final list", "type": "Top 20 after scoring, filtering, and diversity rules" }]
+        },
+        "responsibilities": [
+          "Predicts several outcomes (click, watch time, purchase) and blends them into one score.",
+          "Applies filters: already seen, unavailable, age-restricted, blocked creators.",
+          "Re-ranks for diversity and freshness, and reserves slots for exploration."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Optimising clicks alone",
+            "impact": "Clickbait rises; long-term satisfaction falls.",
+            "mitigation": "Blend in longer-term signals (watch time, returns, surveys) and guardrail metrics in A/B tests."
+          },
+          {
+            "scenario": "Bad model version deployed",
+            "impact": "Engagement drops across the product.",
+            "mitigation": "Shadow scoring, canary traffic, and automatic rollback on metric drops."
+          }
+        ]
+      }
+    },
+    {
+      "id": "events",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Event Stream",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka", "Flink"],
+        "io": {
+          "input": [{ "name": "Events", "type": "{ requestId, userId, itemId, position, action, ts }" }],
+          "output": [{ "name": "Labelled data", "type": "Impressions joined with outcomes" }]
+        },
+        "responsibilities": [
+          "Collects impressions and interactions from every client.",
+          "Joins outcomes to the impression and its logged features.",
+          "Updates real-time counters such as item CTR in the last hour."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bot traffic in the logs",
+            "impact": "Models learn from fake clicks.",
+            "mitigation": "Bot filtering before training; anomaly detection on click patterns."
+          },
+          {
+            "scenario": "Late-arriving events",
+            "impact": "Some clicks are labelled as non-clicks.",
+            "mitigation": "Use a watermark window before labelling negatives."
+          }
+        ]
+      }
+    },
+    {
+      "id": "training",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Offline Training",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Spark", "PyTorch", "Model registry"],
+        "io": {
+          "input": [{ "name": "Training set", "type": "Days of logged features + labels" }],
+          "output": [{ "name": "Artifacts", "type": "New ranking model, item embeddings, batch features" }]
+        },
+        "responsibilities": [
+          "Retrains models and embeddings daily or continuously.",
+          "Validates offline metrics before a version reaches an A/B test.",
+          "Backfills batch features into the online store."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Feedback loop bias",
+            "impact": "The model only learns about items it already chose to show.",
+            "mitigation": "Exploration traffic and position-bias correction in training."
+          },
+          {
+            "scenario": "Data leakage in features",
+            "impact": "Great offline metrics, useless in production.",
+            "mitigation": "Point-in-time correct joins: only use feature values known at impression time."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-api", "source": "app", "sourceHandle": "r", "target": "rec-api", "targetHandle": "l", "data": { "flow": "serving", "payload": "GET /recs ⇄ ranked items", "steps": [1, 6], "bidirectional": true } },
+    { "id": "e-api-candidates", "source": "rec-api", "sourceHandle": "t", "target": "candidates", "targetHandle": "l", "data": { "flow": "retrieval", "payload": "ANN → ~1,000 candidates", "steps": [2], "bidirectional": true } },
+    { "id": "e-api-features", "source": "rec-api", "sourceHandle": "b", "target": "features", "targetHandle": "l", "data": { "flow": "retrieval", "payload": "user + item features", "steps": [3], "bidirectional": true } },
+    { "id": "e-api-ranker", "source": "rec-api", "sourceHandle": "r", "target": "ranker", "targetHandle": "l", "data": { "flow": "serving", "payload": "score → filter → diversify", "steps": [4, 5], "bidirectional": true } },
+    { "id": "e-app-events", "source": "app", "sourceHandle": "t", "target": "events", "targetHandle": "t", "data": { "flow": "feedback", "payload": "impressions + clicks", "steps": [7] } },
+    { "id": "e-events-training", "source": "events", "sourceHandle": "b", "target": "training", "targetHandle": "t", "data": { "flow": "feedback", "payload": "labelled examples", "steps": [8] } },
+    { "id": "e-training-features", "source": "training", "sourceHandle": "b", "target": "features", "targetHandle": "b", "data": { "flow": "feedback", "payload": "new models + embeddings", "steps": [8] } }
+  ]
+}

@@ -1,0 +1,290 @@
+{
+  "schemaVersion": 1,
+  "id": "video-streaming",
+  "title": "Video Streaming (VOD)",
+  "summary": "On-demand video works by doing the expensive work once and the cheap work millions of times. Each title is encoded ahead of time into a ladder of qualities, cut into short encrypted segments, and spread across a CDN. The player then downloads segments a few seconds ahead, switching quality as the network changes so the picture never stops.",
+  "flows": {
+    "ingest": { "label": "Ingest & encode (offline)", "color": "#a78bfa", "animated": false },
+    "playback": { "label": "Playback", "color": "#38bdf8" },
+    "telemetry": { "label": "Quality-of-experience telemetry", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Upload the master", "text": "A studio delivers a mezzanine file: a near-lossless master that can be 100+ GB for a feature film, uploaded in parallel parts to object storage." },
+    { "step": 2, "title": "Encode the ladder", "text": "The file is split into chunks encoded in parallel into a ladder of renditions, from about 235 kbps at 320p to 15+ Mbps 4K HDR. Per-title encoding picks the ladder that suits each film's complexity." },
+    { "step": 3, "title": "Package and encrypt", "text": "Renditions are cut into 2 to 6 second CMAF segments, encrypted once, and described by HLS and DASH manifests that work with FairPlay, Widevine, and PlayReady DRM." },
+    { "step": 4, "title": "Start playback", "text": "The player asks the playback API to play a title. It checks the subscription, region rights, and device, then returns a signed manifest URL and issues a DRM licence." },
+    { "step": 5, "title": "Fetch segments", "text": "The player downloads segments from the nearest CDN edge. On a miss, the edge fetches from a regional shield and then the origin, but popular titles are pre-positioned overnight." },
+    { "step": 6, "title": "Adapt the bitrate", "text": "After each segment the player measures throughput and buffer level and picks the next rendition, dropping quality before the buffer runs dry rather than stalling." },
+    { "step": 7, "title": "Report experience", "text": "The player sends beacons for startup time, rebuffering, bitrate, and errors. Operators use them to pick better CDNs and encodes." }
+  ],
+  "nodes": [
+    {
+      "id": "upload",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Content Ingest",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["S3 multipart upload", "Aspera / Signiant"],
+        "io": {
+          "input": [{ "name": "Studio delivery", "type": "Mezzanine: ProRes / JPEG 2000 + audio stems + subtitles" }],
+          "output": [{ "name": "Source asset", "type": "s3://masters/{titleId}/source.mov + metadata" }]
+        },
+        "responsibilities": [
+          "Receives huge masters reliably with resumable, parallel multipart uploads.",
+          "Validates the file (checksums, frame rate, audio channel layout) before expensive encoding starts.",
+          "Registers metadata, rights windows, and the territories the title may play in."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Corrupt or mislabelled master",
+            "impact": "Hours of encoding produce a broken title; audio out of sync.",
+            "mitigation": "Automated QC (checksums, black-frame and audio-sync detection) before encoding."
+          },
+          {
+            "scenario": "Upload interrupted at 90 GB",
+            "impact": "Restarting from zero delays the release.",
+            "mitigation": "Multipart upload resumes from the last completed part."
+          }
+        ]
+      }
+    },
+    {
+      "id": "transcode",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Transcoding Pipeline",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["FFmpeg / x265 / SVT-AV1", "Spot GPU/CPU fleet"],
+        "io": {
+          "input": [{ "name": "Source", "type": "Mezzanine split into ~1-minute chunks" }],
+          "output": [{ "name": "Renditions", "type": "H.264 / HEVC / AV1 ladder: 320p@235k … 2160p@16M" }]
+        },
+        "responsibilities": [
+          "Encodes chunks in parallel across thousands of machines, then stitches them per rendition.",
+          "Picks a per-title ladder: cartoons need far fewer bits than grainy action films.",
+          "Scores output quality (VMAF) and re-encodes any rendition that falls below target."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Spot instances reclaimed mid-job",
+            "impact": "Chunks lost; the title is late.",
+            "mitigation": "Chunk-level retries, so only the lost minute is re-encoded."
+          },
+          {
+            "scenario": "Visible seams where chunks join",
+            "impact": "A flicker every minute in the final video.",
+            "mitigation": "Split on keyframe boundaries with closed GOPs and verify with quality checks."
+          }
+        ]
+      }
+    },
+    {
+      "id": "package",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Packaging & DRM",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["CMAF", "HLS / DASH", "CENC (cbcs)"],
+        "io": {
+          "input": [{ "name": "Renditions", "type": "Encoded video + audio tracks + subtitles" }],
+          "output": [{ "name": "Segments", "type": "Encrypted .m4s segments + master.m3u8 / manifest.mpd" }]
+        },
+        "responsibilities": [
+          "Cuts every rendition into aligned segments so the player can switch quality at any boundary.",
+          "Encrypts once (CMAF with cbcs) so one copy serves Apple, Android, and TV devices.",
+          "Registers content keys with the DRM key server; keys never travel with the content."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Segments misaligned across renditions",
+            "impact": "Switching quality causes a visible jump or a decode error.",
+            "mitigation": "Fixed keyframe interval across the whole ladder; validate alignment automatically."
+          },
+          {
+            "scenario": "Content key leaked",
+            "impact": "Pirated copies of the title spread.",
+            "mitigation": "Per-title (or per-rendition) keys in a hardware-backed key store; rotate keys for live content."
+          }
+        ]
+      }
+    },
+    {
+      "id": "origin",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Origin Storage",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["S3 / GCS", "Origin shield"],
+        "io": {
+          "input": [{ "name": "Packaged title", "type": "Segments + manifests (~10-20 GB per title across the ladder)" }],
+          "output": [{ "name": "Origin fetch", "type": "HTTP GET /{titleId}/{rendition}/seg_00042.m4s" }]
+        },
+        "responsibilities": [
+          "Holds the master copy of every segment for every title.",
+          "Sits behind a shield tier so a CDN cache miss rarely reaches it directly.",
+          "Feeds overnight pre-positioning of popular titles to edge caches."
+        ],
+        "failureModes": [
+          {
+            "scenario": "New release: cold caches everywhere at 00:00",
+            "impact": "Millions of misses hit the origin at the same moment.",
+            "mitigation": "Pre-position the title to edges before release; request coalescing at the shield."
+          },
+          {
+            "scenario": "Origin region outage",
+            "impact": "Uncached segments fail to load.",
+            "mitigation": "Replicate to a second region; most traffic is served from caches anyway."
+          }
+        ]
+      }
+    },
+    {
+      "id": "playback-api",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Playback & Licence API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Entitlement service", "Widevine / FairPlay licence servers"],
+        "io": {
+          "input": [{ "name": "Play request", "type": "POST /play { titleId, deviceId, capabilities } + auth" }],
+          "output": [{ "name": "Playback info", "type": "JSON: { manifestUrl (signed, expiring), cdn, licenceUrl }" }]
+        },
+        "responsibilities": [
+          "Checks subscription, region rights, and concurrent-stream limits before playback.",
+          "Chooses a CDN and the formats the device supports (codec, HDR, resolution cap).",
+          "Issues DRM licences bound to the device, with output protection rules (e.g. HDCP for 4K)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Licence server down",
+            "impact": "Nothing can start playing, even though the segments are cached everywhere.",
+            "mitigation": "Multi-region licence servers; persistent licences for downloaded content."
+          },
+          {
+            "scenario": "Signed URLs shared publicly",
+            "impact": "Freeloaders stream on someone else's account.",
+            "mitigation": "Short expiry, tokens bound to the session, and concurrent-stream enforcement."
+          }
+        ]
+      }
+    },
+    {
+      "id": "player",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Video Player",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["ExoPlayer / AVPlayer / Shaka", "ABR algorithm"],
+        "io": {
+          "input": [{ "name": "Media", "type": "Manifest + licence + segments" }],
+          "output": [
+            { "name": "Segment requests", "type": "GET seg_00042.m4s at the chosen rendition" },
+            { "name": "QoE beacons", "type": "JSON: { startupMs, rebufferMs, bitrate, droppedFrames, errors }" }
+          ]
+        },
+        "responsibilities": [
+          "Keeps a buffer (say 30 seconds) and picks each next segment's quality from throughput and buffer level.",
+          "Starts fast with a low rendition and climbs, because waiting to start is worse than a soft first few seconds.",
+          "Decrypts inside the device's secure hardware path for high-resolution content."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Network drops suddenly (train enters a tunnel)",
+            "impact": "Buffer drains and playback stalls (rebuffering).",
+            "mitigation": "Buffer-based ABR switches down early; the lowest rendition is tiny so it almost always loads."
+          },
+          {
+            "scenario": "Quality oscillates every few seconds",
+            "impact": "The picture keeps sharpening and blurring, which annoys viewers.",
+            "mitigation": "Hysteresis in the ABR logic: switch up slowly, down quickly."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cdn",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "CDN Edge Caches",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Open Connect / Akamai / CloudFront"],
+        "io": {
+          "input": [{ "name": "Segment request", "type": "HTTP GET (signed URL)" }],
+          "output": [{ "name": "Segment", "type": "~1-8 MB .m4s, served from cache (hit ratio > 95%)" }]
+        },
+        "responsibilities": [
+          "Serves segments from servers inside ISPs, close to viewers.",
+          "Caches the popular catalogue; popularity follows a power law, so a small share of titles is most traffic.",
+          "Validates the signed URL token before serving."
+        ],
+        "failureModes": [
+          {
+            "scenario": "One CDN degrades in a region",
+            "impact": "Rebuffering for everyone routed there.",
+            "mitigation": "Use QoE telemetry to steer new sessions to another CDN automatically."
+          },
+          {
+            "scenario": "Evening peak saturates an ISP link",
+            "impact": "Throughput drops and quality falls.",
+            "mitigation": "Embedded caches inside ISP networks; more efficient codecs (AV1) at peak."
+          }
+        ]
+      }
+    },
+    {
+      "id": "telemetry",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "QoE Telemetry",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka", "Druid / ClickHouse"],
+        "io": {
+          "input": [{ "name": "Beacons", "type": "Player events every ~10-60 s per session" }],
+          "output": [{ "name": "Insights", "type": "Rebuffer ratio, startup time by CDN × ISP × device; CDN steering signals" }]
+        },
+        "responsibilities": [
+          "Aggregates playback quality in near real time by CDN, ISP, device, and title.",
+          "Feeds CDN steering and alerting when a region's rebuffer rate spikes.",
+          "Shows which encodes and ABR tweaks actually improve viewing."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Telemetry pipeline lags",
+            "impact": "CDN problems are detected late.",
+            "mitigation": "A lightweight real-time path for key metrics, separate from the full analytics pipeline."
+          },
+          {
+            "scenario": "Beacons lost when playback crashes",
+            "impact": "The worst sessions are the least visible.",
+            "mitigation": "Send a session-start beacon; treat a missing end beacon as a failure signal."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-upload-transcode", "source": "upload", "sourceHandle": "r", "target": "transcode", "targetHandle": "l", "data": { "flow": "ingest", "payload": "mezzanine (100+ GB)", "steps": [1] } },
+    { "id": "e-transcode-package", "source": "transcode", "sourceHandle": "r", "target": "package", "targetHandle": "l", "data": { "flow": "ingest", "payload": "bitrate ladder", "steps": [2] } },
+    { "id": "e-package-origin", "source": "package", "sourceHandle": "r", "target": "origin", "targetHandle": "l", "data": { "flow": "ingest", "payload": "encrypted segments", "steps": [3] } },
+    { "id": "e-player-api", "source": "player", "sourceHandle": "l", "target": "playback-api", "targetHandle": "r", "data": { "flow": "playback", "payload": "play ⇄ manifest + licence", "steps": [4], "bidirectional": true } },
+    { "id": "e-player-cdn", "source": "player", "sourceHandle": "r", "target": "cdn", "targetHandle": "l", "data": { "flow": "playback", "payload": "GET segments (ABR)", "steps": [5, 6], "bidirectional": true } },
+    { "id": "e-cdn-origin", "source": "cdn", "sourceHandle": "t", "target": "origin", "targetHandle": "b", "data": { "flow": "playback", "payload": "miss → shield → origin", "steps": [5], "bidirectional": true } },
+    { "id": "e-player-telemetry", "source": "player", "sourceHandle": "b", "target": "telemetry", "targetHandle": "b", "data": { "flow": "telemetry", "payload": "QoE beacons", "steps": [7] } }
+  ]
+}
