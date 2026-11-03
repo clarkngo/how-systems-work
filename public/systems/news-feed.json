@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "id": "news-feed",
+  "title": "Social News Feed",
+  "summary": "A news feed has to answer 'what should this person see right now?' for hundreds of millions of people. Most feeds use a hybrid. A normal user's post is fanned out on write into each follower's precomputed timeline, but a celebrity's post would mean 50 million writes, so those are pulled at read time instead. The reader's feed merges both, ranks them, and loads the post bodies.",
+  "flows": {
+    "write": { "label": "Write path (fan-out)", "color": "#a78bfa" },
+    "read": { "label": "Read path", "color": "#38bdf8" },
+    "lookup": { "label": "Graph & hydration", "color": "#fbbf24" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Publish a post", "text": "A user posts a photo. The post service stores it durably and assigns a time-sortable ID (Snowflake-style), so IDs sort by creation time." },
+    { "step": 2, "title": "Emit PostCreated", "text": "An event goes onto a queue so fan-out happens asynchronously. The author's request returns immediately." },
+    { "step": 3, "title": "Look up followers", "text": "Fan-out workers page through the author's followers from the social graph. If the author has millions of followers, fan-out is skipped and the post is fetched at read time instead." },
+    { "step": 4, "title": "Fan out on write", "text": "For each follower, the post ID is pushed onto their timeline list in Redis, capped at about 800 entries. Inactive followers can be skipped to save work." },
+    { "step": 5, "title": "Open the feed", "text": "A reader opens the app. The feed service reads their precomputed timeline, a list of post IDs, in a single fast call." },
+    { "step": 6, "title": "Merge and hydrate", "text": "Recent posts from the celebrities the reader follows are pulled and merged in. The post service then returns bodies, counts, and author info for the candidate IDs in a batch." },
+    { "step": 7, "title": "Rank and return", "text": "A ranking model orders posts by predicted engagement rather than pure recency, removes blocked or deleted items, and returns the first page with a cursor for the next." }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Mobile / Web Client",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Infinite scroll", "Local cache"],
+        "io": {
+          "input": [{ "name": "Feed page", "type": "{ posts: [...], nextCursor }" }],
+          "output": [{ "name": "Requests", "type": "POST /posts · GET /feed?cursor=…" }]
+        },
+        "responsibilities": [
+          "Publishes posts and loads the feed page by page.",
+          "Caches the last feed so the app opens instantly, then refreshes.",
+          "Prefetches the next page and media while the user scrolls."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Offset pagination while new posts arrive",
+            "impact": "Duplicates or skipped posts while scrolling.",
+            "mitigation": "Cursor-based pagination anchored on post ID or rank snapshot."
+          },
+          {
+            "scenario": "Slow network",
+            "impact": "Blank feed.",
+            "mitigation": "Show the cached feed and low-res images first."
+          }
+        ]
+      }
+    },
+    {
+      "id": "feed-api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Feed API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Stateless service", "GraphQL / REST"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Authenticated post or feed read" }],
+          "output": [
+            { "name": "Write", "type": "createPost(author, media, text)" },
+            { "name": "Read", "type": "getFeed(userId, cursor, n=20)" }
+          ]
+        },
+        "responsibilities": [
+          "Routes writes to the post service and reads to feed assembly.",
+          "Applies per-user rate limits on posting.",
+          "Shapes the response for each client version."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Read traffic spike (major live event)",
+            "impact": "Feed latency climbs for everyone.",
+            "mitigation": "Autoscale stateless tiers; serve cached pages; degrade ranking to recency."
+          },
+          {
+            "scenario": "Spam bot posts in bulk",
+            "impact": "Fan-out amplifies spam into millions of timelines.",
+            "mitigation": "Posting rate limits and spam checks before fan-out."
+          }
+        ]
+      }
+    },
+    {
+      "id": "posts",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Post Service",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Sharded MySQL / Cassandra", "Memcached"],
+        "io": {
+          "input": [{ "name": "Post / lookup", "type": "Insert post · multiget(postIds[])" }],
+          "output": [{ "name": "Post data", "type": "{ id, author, text, mediaUrls, likeCount, createdAt }" }]
+        },
+        "responsibilities": [
+          "Stores posts durably, sharded by post ID or author.",
+          "Serves batched lookups with a large cache in front.",
+          "Keeps each author's recent posts for the pull side of the hybrid."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Viral post: hot key in cache",
+            "impact": "One cache node is overloaded.",
+            "mitigation": "Replicate hot keys across nodes and add a small in-process cache."
+          },
+          {
+            "scenario": "Post deleted after fan-out",
+            "impact": "Timelines still reference it.",
+            "mitigation": "Filter at hydration; lazy cleanup of timeline entries."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ranker",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Feed Assembly & Ranking",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Ranking model", "Merge + filter"],
+        "io": {
+          "input": [{ "name": "Candidates", "type": "Timeline IDs + celebrity posts + features" }],
+          "output": [{ "name": "Page", "type": "20 ranked, hydrated posts + cursor" }]
+        },
+        "responsibilities": [
+          "Merges pushed timeline entries with pulled celebrity posts.",
+          "Ranks by predicted engagement, recency, and relationship strength.",
+          "Removes blocked, muted, deleted, or already-seen posts."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ranking model unavailable",
+            "impact": "No feed.",
+            "mitigation": "Fall back to reverse-chronological order of the candidates."
+          },
+          {
+            "scenario": "Engagement-only ranking",
+            "impact": "Outrage and low-quality content win.",
+            "mitigation": "Integrity signals and quality guardrails in the objective."
+          }
+        ]
+      }
+    },
+    {
+      "id": "fanout",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Fan-out Workers",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka consumers", "Batched Redis pipelines"],
+        "io": {
+          "input": [{ "name": "PostCreated", "type": "{ postId, authorId, followerCount }" }],
+          "output": [{ "name": "Timeline writes", "type": "LPUSH + LTRIM timeline:{followerId} postId" }]
+        },
+        "responsibilities": [
+          "Pushes each new post ID to every follower's timeline.",
+          "Skips authors over a follower threshold; they are pulled at read time.",
+          "Prioritises active followers so they see posts first."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Fan-out lag",
+            "impact": "Followers see posts minutes late.",
+            "mitigation": "Scale workers on lag; deliver to active users first."
+          },
+          {
+            "scenario": "Worker crashes midway through followers",
+            "impact": "Some followers miss the post or get it twice.",
+            "mitigation": "Checkpoint progress per batch; timeline writes deduplicate on post ID."
+          }
+        ]
+      }
+    },
+    {
+      "id": "timeline",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Timeline Cache",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Redis Cluster", "Capped lists"],
+        "io": {
+          "input": [{ "name": "Push", "type": "postId to timeline:{userId}" }],
+          "output": [{ "name": "Timeline", "type": "Latest ~800 postIds for a user" }]
+        },
+        "responsibilities": [
+          "Holds a precomputed list of post IDs per user, IDs only and not bodies, to save memory.",
+          "Makes the read path a single O(1) lookup.",
+          "Is rebuilt from the graph and posts when a user returns after a long absence."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cache node lost",
+            "impact": "Affected users' timelines are empty.",
+            "mitigation": "Replicas, plus rebuild on read by pulling from followees."
+          },
+          {
+            "scenario": "Memory cost for inactive users",
+            "impact": "Paying to store timelines nobody reads.",
+            "mitigation": "Only maintain timelines for recently active users; others are built when they return."
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Social Graph",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["TAO-style graph store", "Sharded by user"],
+        "io": {
+          "input": [{ "name": "Query", "type": "followers(authorId, cursor) · followees(userId)" }],
+          "output": [{ "name": "Edges", "type": "Paged user ID lists + follower counts" }]
+        },
+        "responsibilities": [
+          "Stores follow relationships in both directions.",
+          "Pages through millions of followers efficiently for fan-out.",
+          "Tells fan-out which authors are celebrities by follower count."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Unfollow not applied before fan-out",
+            "impact": "A user sees posts from someone they unfollowed.",
+            "mitigation": "Re-check follow status at read and hydration time."
+          },
+          {
+            "scenario": "Celebrity's follower list on one shard",
+            "impact": "That shard is hammered on each post.",
+            "mitigation": "Pull model for celebrities; split large follower lists across shards."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-api", "source": "client", "sourceHandle": "r", "target": "feed-api", "targetHandle": "l", "data": { "flow": "read", "payload": "post / GET feed ⇄ page", "steps": [1, 5, 7], "bidirectional": true } },
+    { "id": "e-api-posts", "source": "feed-api", "sourceHandle": "t", "target": "posts", "targetHandle": "l", "data": { "flow": "write", "payload": "store post", "steps": [1] } },
+    { "id": "e-posts-fanout", "source": "posts", "sourceHandle": "r", "target": "fanout", "targetHandle": "l", "data": { "flow": "write", "payload": "PostCreated", "steps": [2] } },
+    { "id": "e-fanout-graph", "source": "fanout", "sourceHandle": "r", "target": "graph", "targetHandle": "t", "data": { "flow": "lookup", "payload": "followers (skip celebrities)", "steps": [3], "bidirectional": true } },
+    { "id": "e-fanout-timeline", "source": "fanout", "sourceHandle": "b", "target": "timeline", "targetHandle": "t", "data": { "flow": "write", "payload": "push postId to followers", "steps": [4] } },
+    { "id": "e-api-ranker", "source": "feed-api", "sourceHandle": "b", "target": "ranker", "targetHandle": "l", "data": { "flow": "read", "payload": "getFeed ⇄ ranked page", "steps": [5, 7], "bidirectional": true } },
+    { "id": "e-ranker-timeline", "source": "ranker", "sourceHandle": "r", "target": "timeline", "targetHandle": "l", "data": { "flow": "read", "payload": "timeline postIds", "steps": [5], "bidirectional": true } },
+    { "id": "e-ranker-posts", "source": "ranker", "sourceHandle": "t", "target": "posts", "targetHandle": "b", "data": { "flow": "lookup", "payload": "celebrity pull + hydrate", "steps": [6], "bidirectional": true } }
+  ]
+}

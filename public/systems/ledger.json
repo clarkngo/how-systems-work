@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "ledger",
+  "title": "Double-Entry Ledger",
+  "summary": "A ledger is the system of record for money. Every movement is recorded as a balanced journal entry: debits equal credits, so money is never created or lost by a bug. Entries are append-only, so mistakes are fixed with new reversing entries, never edits. Balances are derived from the entries, and reconciliation checks the books against what the bank says actually happened.",
+  "flows": {
+    "posting": { "label": "Posting", "color": "#38bdf8" },
+    "storage": { "label": "Atomic write", "color": "#a78bfa" },
+    "recon": { "label": "Reconciliation & reporting", "color": "#fbbf24", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Post a transaction", "text": "The payments service asks the ledger to record a $100 card payment: debit the customer's cash-in-transit account and credit the merchant's payable account. It includes an idempotency key." },
+    { "step": 2, "title": "Validate and write entries", "text": "The ledger checks that debits equal credits, that the accounts exist, and that the currencies match, then appends the lines to the immutable journal." },
+    { "step": 3, "title": "Update balances atomically", "text": "In the same database transaction, the account balances change with an optimistic version check, so two concurrent postings cannot both overdraw an account." },
+    { "step": 4, "title": "Return the entry", "text": "The caller gets an entry ID. Retrying with the same idempotency key returns the same entry rather than posting twice." },
+    { "step": 5, "title": "Reconcile with the bank", "text": "Each day the bank's settlement file is matched line by line against ledger entries for the clearing account. Every dollar must match." },
+    { "step": 6, "title": "Resolve breaks", "text": "Unmatched items, such as a missing settlement or a fee the bank deducted, become exceptions. They are fixed with new adjusting entries, never by editing history." },
+    { "step": 7, "title": "Close and report", "text": "At period end, balances are frozen, a trial balance checks that total debits equal total credits, and results export to the general ledger for finance." }
+  ],
+  "nodes": [
+    {
+      "id": "services",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Product Services",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Payments, Wallet, Payouts"],
+        "io": {
+          "input": [{ "name": "Result", "type": "{ entryId, status: posted } or rejection" }],
+          "output": [{ "name": "Posting", "type": "POST /entries { idempotencyKey, lines[], metadata }" }]
+        },
+        "responsibilities": [
+          "Describe business events as money movements between named accounts.",
+          "Send a stable idempotency key per business event so retries are safe.",
+          "Never keep their own balance; they ask the ledger."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Timeout, then retry with a new key",
+            "impact": "The payment is recorded twice.",
+            "mitigation": "Derive the key from the business event (e.g. paymentId:capture), not per attempt."
+          },
+          {
+            "scenario": "Service keeps a side balance",
+            "impact": "Two sources of truth drift apart.",
+            "mitigation": "The ledger is the only balance; services cache with clear staleness rules."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ledger-api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Ledger Service",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Go / Java service", "Integer minor units"],
+        "io": {
+          "input": [{ "name": "Posting", "type": "lines: [{ account, debit|credit, amount: 10000, currency: USD }]" }],
+          "output": [{ "name": "Transaction", "type": "One DB transaction: journal lines + balance updates" }]
+        },
+        "responsibilities": [
+          "Rejects any posting where debits ≠ credits per currency.",
+          "Stores amounts as integers in minor units (cents); never floating point.",
+          "Enforces account rules such as 'customer wallet may not go negative'."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Floating-point amounts",
+            "impact": "0.1 + 0.2 ≠ 0.3; pennies appear and vanish.",
+            "mitigation": "Integer minor units or fixed-precision decimals end to end."
+          },
+          {
+            "scenario": "Hot account (one platform fee account) on every posting",
+            "impact": "Row-lock contention caps throughput.",
+            "mitigation": "Split the hot account into sub-accounts and sum them on read."
+          }
+        ]
+      }
+    },
+    {
+      "id": "journal",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Journal (Append-Only)",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres", "Insert-only table"],
+        "io": {
+          "input": [{ "name": "Entry", "type": "entry_id, line_no, account_id, amount, direction, posted_at" }],
+          "output": [{ "name": "History", "type": "Every movement ever, in order" }]
+        },
+        "responsibilities": [
+          "Stores every journal line permanently: no UPDATE or DELETE is allowed.",
+          "Is the source of truth: any balance can be rebuilt by summing lines.",
+          "Provides an audit trail of who posted what, when, and why."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Someone 'fixes' a row by hand",
+            "impact": "History no longer explains the balance; audit failure.",
+            "mitigation": "DB permissions without UPDATE/DELETE; corrections only as reversing entries."
+          },
+          {
+            "scenario": "Table grows to billions of rows",
+            "impact": "Queries and backups slow down.",
+            "mitigation": "Partition by month; archive closed periods to cheaper storage."
+          }
+        ]
+      }
+    },
+    {
+      "id": "balances",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Account Balances",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres", "Optimistic versioning"],
+        "io": {
+          "input": [{ "name": "Delta", "type": "UPDATE … SET balance = balance - 10000, version = v+1 WHERE version = v" }],
+          "output": [{ "name": "Balance", "type": "{ accountId, available, pending, version }" }]
+        },
+        "responsibilities": [
+          "Keeps a running balance per account, updated in the same transaction as the journal.",
+          "Separates pending (authorised) from available (settled) funds.",
+          "Answers balance reads fast without summing history."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Balance updated outside the journal transaction",
+            "impact": "Balance and journal disagree.",
+            "mitigation": "Single ACID transaction; nightly job re-sums the journal and alerts on drift."
+          },
+          {
+            "scenario": "Concurrent withdrawals race",
+            "impact": "Account overdrawn.",
+            "mitigation": "Version check or SELECT … FOR UPDATE; retry on conflict."
+          }
+        ]
+      }
+    },
+    {
+      "id": "recon",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Reconciliation",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Daily batch jobs", "Matching rules"],
+        "io": {
+          "input": [{ "name": "Both sides", "type": "Ledger entries + bank / processor settlement lines" }],
+          "output": [{ "name": "Result", "type": "Matched, plus exceptions: { missing, amount_mismatch, unknown }" }]
+        },
+        "responsibilities": [
+          "Matches every external movement to a ledger entry by reference, amount, and date.",
+          "Raises exceptions for anything unmatched beyond a tolerance window.",
+          "Proves the ledger reflects reality, not just that it is internally consistent."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bank deducts fees inside a net settlement",
+            "impact": "Totals never match gross ledger entries.",
+            "mitigation": "Model fees explicitly and match the net amount as gross minus fees."
+          },
+          {
+            "scenario": "Exceptions pile up unresolved",
+            "impact": "Real losses hide among noise.",
+            "mitigation": "Ageing reports, ownership per exception type, and an SLA for resolution."
+          }
+        ]
+      }
+    },
+    {
+      "id": "bank",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Banks & Processors",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["BAI2 / MT940 / CAMT.053", "SFTP / API"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Statement or settlement report request" }],
+          "output": [{ "name": "Statement", "type": "Daily file: credits, debits, fees, references" }]
+        },
+        "responsibilities": [
+          "Report what money actually moved in real bank accounts.",
+          "Settle card and transfer batches, often a day or more later.",
+          "Provide the external truth the ledger is checked against."
+        ],
+        "failureModes": [
+          {
+            "scenario": "File arrives late or malformed",
+            "impact": "Reconciliation cannot run; the close is delayed.",
+            "mitigation": "Schema validation, alerts on missing files, and API fallback."
+          },
+          {
+            "scenario": "Returned payment days later (ACH return)",
+            "impact": "Money counted as received is gone.",
+            "mitigation": "Track pending vs settled; post a reversal entry on return."
+          }
+        ]
+      }
+    },
+    {
+      "id": "reporting",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Close & Reporting",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Data warehouse", "ERP / GL export"],
+        "io": {
+          "input": [{ "name": "Period data", "type": "Journal + reconciliation results" }],
+          "output": [{ "name": "Reports", "type": "Trial balance, GL journal export, regulatory reports" }]
+        },
+        "responsibilities": [
+          "Runs the trial balance: total debits must equal total credits.",
+          "Locks closed periods so late changes go into the current period.",
+          "Exports summarised entries to the company's general ledger."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Posting backdated into a closed month",
+            "impact": "Published financials change after the fact.",
+            "mitigation": "Reject postings dated in closed periods; adjustments go into the current period."
+          },
+          {
+            "scenario": "Trial balance does not net to zero",
+            "impact": "A bug created or destroyed money somewhere.",
+            "mitigation": "Run the check continuously, not just at close, and page someone on any non-zero result."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-services-api", "source": "services", "sourceHandle": "r", "target": "ledger-api", "targetHandle": "l", "data": { "flow": "posting", "payload": "post entry ⇄ entryId", "steps": [1, 4], "bidirectional": true } },
+    { "id": "e-api-journal", "source": "ledger-api", "sourceHandle": "t", "target": "journal", "targetHandle": "l", "data": { "flow": "storage", "payload": "balanced lines (insert-only)", "steps": [2] } },
+    { "id": "e-api-balances", "source": "ledger-api", "sourceHandle": "b", "target": "balances", "targetHandle": "l", "data": { "flow": "storage", "payload": "same txn, version check", "steps": [3] } },
+    { "id": "e-journal-recon", "source": "journal", "sourceHandle": "r", "target": "recon", "targetHandle": "l", "data": { "flow": "recon", "payload": "entries by account", "steps": [5] } },
+    { "id": "e-bank-recon", "source": "bank", "sourceHandle": "t", "target": "recon", "targetHandle": "b", "data": { "flow": "recon", "payload": "settlement files", "steps": [5] } },
+    { "id": "e-recon-reporting", "source": "recon", "sourceHandle": "r", "target": "reporting", "targetHandle": "t", "data": { "flow": "recon", "payload": "matched + exceptions", "steps": [6, 7] } },
+    { "id": "e-recon-api", "source": "recon", "sourceHandle": "t", "target": "ledger-api", "targetHandle": "t", "data": { "flow": "posting", "payload": "adjusting entries", "steps": [6] } }
+  ]
+}
