@@ -1,0 +1,296 @@
+{
+  "schemaVersion": 1,
+  "id": "fraud-detection",
+  "title": "Real-Time Fraud Detection",
+  "summary": "Fraud detection decides, in under 100 milliseconds and while the customer waits, whether a payment looks like the real cardholder. It looks up behaviour features computed from recent activity, scores them with a model, and applies business rules; uncertain cases go to human analysts. The hard part is learning: the truth (a chargeback) arrives weeks later.",
+  "flows": {
+    "decision": { "label": "Decision path (synchronous)", "color": "#38bdf8" },
+    "features": { "label": "Feature & model calls", "color": "#a78bfa" },
+    "review": { "label": "Manual review", "color": "#fbbf24" },
+    "learning": { "label": "Labels & retraining (batch)", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Payment arrives", "text": "Checkout calls the risk API synchronously with the transaction: amount, card fingerprint, device ID, IP, email, and merchant. The whole decision has a budget of about 50 to 100 milliseconds." },
+    { "step": 2, "title": "Look up features", "text": "Precomputed signals are fetched in a few milliseconds: how many cards this device used in the last hour, distance between IP and billing address, account age, and the email's history across merchants." },
+    { "step": 3, "title": "Score with the model", "text": "A gradient-boosted model turns roughly 200 features into a fraud probability, such as 0.87." },
+    { "step": 4, "title": "Apply rules", "text": "Rules combine the score with business policy: block lists, per-merchant thresholds, and 'send to 3-D Secure if score > 0.6 and amount > $500'." },
+    { "step": 5, "title": "Route borderline cases", "text": "High-value orders in the grey zone are held and queued for an analyst instead of being auto-declined." },
+    { "step": 6, "title": "Respond", "text": "Checkout receives approve, challenge (3-D Secure), review, or decline, plus reason codes it can log." },
+    { "step": 7, "title": "Collect the truth", "text": "Chargebacks arrive 30 to 90 days later, and analyst verdicts arrive within hours. Both become labels joined back to the original features." },
+    { "step": 8, "title": "Retrain and deploy", "text": "A new model trains on the latest labels, runs in shadow mode against live traffic, then takes over gradually once its precision and recall beat the current one." }
+  ],
+  "nodes": [
+    {
+      "id": "checkout",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Checkout / Payment Request",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Merchant backend", "Device fingerprint SDK"],
+        "io": {
+          "input": [{ "name": "Decision", "type": "JSON: { action: \"approve\" | \"3ds\" | \"review\" | \"decline\", score, reasons[] }" }],
+          "output": [{ "name": "Risk request", "type": "JSON: { txnId, amount, cardFingerprint, deviceId, ip, email, merchantId }" }]
+        },
+        "responsibilities": [
+          "Collects device and behaviour signals in the browser or app before the payment is submitted.",
+          "Calls the risk API with a strict timeout and acts on the decision.",
+          "Shows a 3-D Secure challenge instead of a hard decline for medium-risk payments."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Risk API times out",
+            "impact": "Checkout must choose between lost sales and unscreened payments.",
+            "mitigation": "Per-merchant fallback policy, e.g. approve under $100, otherwise send to 3-D Secure."
+          },
+          {
+            "scenario": "Device signals blocked by privacy tools",
+            "impact": "Fewer features, so the model is less certain.",
+            "mitigation": "Model trained with missing-feature patterns; missing data alone is never a block reason."
+          }
+        ]
+      }
+    },
+    {
+      "id": "risk-api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Risk Decision API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Go service", "Kafka (decision log)"],
+        "io": {
+          "input": [{ "name": "Risk request", "type": "JSON: transaction + signals" }],
+          "output": [
+            { "name": "Lookups", "type": "Feature keys: card, device, IP, email, merchant" },
+            { "name": "Decision", "type": "JSON: action + score + reason codes" }
+          ]
+        },
+        "responsibilities": [
+          "Orchestrates feature lookup, scoring, and rules within a hard latency budget.",
+          "Logs every decision with the exact feature values used, so training data matches what the model saw.",
+          "Publishes each transaction as an event so streaming jobs update the features for the next one."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Training features computed differently from serving features",
+            "impact": "The model looks great offline and performs poorly in production (training/serving skew).",
+            "mitigation": "Train on the logged serving-time features, not features recomputed later."
+          },
+          {
+            "scenario": "One slow dependency eats the whole budget",
+            "impact": "Every decision falls back to the default policy.",
+            "mitigation": "Per-call deadlines; score with partial features rather than wait."
+          }
+        ]
+      }
+    },
+    {
+      "id": "model",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Model Scoring Service",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["XGBoost / LightGBM", "ONNX runtime"],
+        "io": {
+          "input": [{ "name": "Feature vector", "type": "float[~200] + model version" }],
+          "output": [{ "name": "Score", "type": "JSON: { probability: 0.87, topFeatures[] }" }]
+        },
+        "responsibilities": [
+          "Scores a feature vector in about 5 milliseconds.",
+          "Runs the live model and one or more shadow models side by side on the same traffic.",
+          "Returns the top contributing features so analysts and merchants see why."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Fraudsters adapt to the model (concept drift)",
+            "impact": "Fraud rate climbs within weeks of a new pattern appearing.",
+            "mitigation": "Monitor score distributions and fraud rate daily; retrain frequently."
+          },
+          {
+            "scenario": "Model service down",
+            "impact": "No ML score.",
+            "mitigation": "Rules-only fallback with conservative thresholds."
+          }
+        ]
+      }
+    },
+    {
+      "id": "features",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Real-Time Feature Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Redis / Aerospike", "Flink streaming jobs"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "MGET card:{fp}, device:{id}, ip:{addr}, email:{hash}" }],
+          "output": [{ "name": "Features", "type": "JSON: { card_txn_count_1h: 7, device_cards_24h: 4, ip_bill_km: 6200, … }" }]
+        },
+        "responsibilities": [
+          "Serves precomputed velocity counters and reputation features in single-digit milliseconds.",
+          "Updated continuously by streaming jobs that consume every transaction event.",
+          "Keeps sliding-window counts (1 minute, 1 hour, 24 hours, 30 days) per card, device, IP, and email."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Streaming job lags behind",
+            "impact": "Velocity counters miss the last few minutes; a card-testing burst looks normal.",
+            "mitigation": "Alert on lag in seconds; increment the hottest counters synchronously in the API."
+          },
+          {
+            "scenario": "Hot key from one merchant or IP",
+            "impact": "One shard overloaded; lookups time out.",
+            "mitigation": "Key salting for known hot keys, local caching, and replicas."
+          }
+        ]
+      }
+    },
+    {
+      "id": "rules",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Rules & Policy Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Rule DSL", "Per-merchant config"],
+        "io": {
+          "input": [{ "name": "Score + features", "type": "JSON: { probability, features, amount, merchantId }" }],
+          "output": [
+            { "name": "Action", "type": "approve | 3ds | review | decline + reason codes" },
+            { "name": "Review case", "type": "JSON: { txnId, score, evidence }" }
+          ]
+        },
+        "responsibilities": [
+          "Turns a probability into an action using thresholds tuned to each merchant's appetite for risk.",
+          "Lets analysts ship rules within minutes to stop a new attack before the model learns it.",
+          "Sends grey-zone, high-value cases to manual review."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hundreds of overlapping rules nobody understands",
+            "impact": "Good customers declined for reasons no one can explain.",
+            "mitigation": "Rule owners, expiry dates, and backtesting each rule against labelled history."
+          },
+          {
+            "scenario": "Rule pushed without testing",
+            "impact": "A typo declines all payments in a country.",
+            "mitigation": "Shadow-run new rules and cap their impact (e.g. alert if a rule hits > 1% of traffic)."
+          }
+        ]
+      }
+    },
+    {
+      "id": "review",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Manual Review Queue",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Case management UI", "SLA timers"],
+        "io": {
+          "input": [{ "name": "Cases", "type": "JSON: transaction + score + linked accounts" }],
+          "output": [{ "name": "Verdicts", "type": "JSON: { txnId, verdict: \"fraud\" | \"legit\", analystId }" }]
+        },
+        "responsibilities": [
+          "Shows analysts the evidence: linked accounts, device graph, order history.",
+          "Prioritizes by amount and time to shipment, so goods aren't sent before a decision.",
+          "Produces fast labels within hours instead of the 30 to 90 days chargebacks take."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Queue backs up during a sale",
+            "impact": "Held orders miss shipping cut-offs and customers cancel.",
+            "mitigation": "Auto-decide cases past their SLA by policy; adjust thresholds to control queue volume."
+          },
+          {
+            "scenario": "Analysts only see what the model flags",
+            "impact": "Labels are biased toward the model's existing beliefs.",
+            "mitigation": "Review a small random sample of approved transactions too."
+          }
+        ]
+      }
+    },
+    {
+      "id": "labels",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Labels (Chargebacks & Verdicts)",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Warehouse tables", "Card network dispute feeds"],
+        "io": {
+          "input": [{ "name": "Outcomes", "type": "Analyst verdicts + chargebacks (reason code 10.4 etc.)" }],
+          "output": [{ "name": "Training labels", "type": "SQL: (txnId, features_at_decision, label, label_date)" }]
+        },
+        "responsibilities": [
+          "Joins each outcome to the features that were logged at decision time.",
+          "Tracks label maturity: recent transactions are 'unknown', not 'legit'.",
+          "Separates fraud chargebacks from 'friendly fraud' and service disputes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Recent transactions treated as legitimate",
+            "impact": "The model learns that new fraud patterns are fine.",
+            "mitigation": "Only train on transactions old enough for chargebacks to have arrived."
+          },
+          {
+            "scenario": "Declined transactions never get labels",
+            "impact": "The model can't learn whether its declines were right (selection bias).",
+            "mitigation": "Approve a tiny random holdout of would-be declines to measure true outcomes."
+          }
+        ]
+      }
+    },
+    {
+      "id": "training",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 240 },
+      "data": {
+        "label": "Training & Deployment Pipeline",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Spark", "MLflow registry", "Shadow deploys"],
+        "io": {
+          "input": [{ "name": "Labelled data", "type": "Parquet: features + labels, time-split" }],
+          "output": [{ "name": "Model release", "type": "Model artifact + version → shadow → canary → live" }]
+        },
+        "responsibilities": [
+          "Trains on time-based splits (train on past months, test on the latest), never random splits.",
+          "Compares candidates on precision at the operating threshold and dollars of fraud caught.",
+          "Promotes models gradually: shadow mode, then a small traffic share, then all traffic."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Random train/test split",
+            "impact": "Future information leaks into training; offline metrics are too good to be true.",
+            "mitigation": "Strictly time-ordered splits and leakage checks on every feature."
+          },
+          {
+            "scenario": "New model's score distribution shifts",
+            "impact": "Thresholds tuned for the old model suddenly decline twice as many customers.",
+            "mitigation": "Recalibrate scores and re-tune thresholds in shadow before promotion."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-checkout-risk", "source": "checkout", "sourceHandle": "r", "target": "risk-api", "targetHandle": "l", "data": { "flow": "decision", "payload": "score(txn) ⇄ decision", "steps": [1, 6], "bidirectional": true } },
+    { "id": "e-risk-model", "source": "risk-api", "sourceHandle": "t", "target": "model", "targetHandle": "l", "data": { "flow": "features", "payload": "features ⇄ probability", "steps": [3], "bidirectional": true } },
+    { "id": "e-risk-features", "source": "risk-api", "sourceHandle": "b", "target": "features", "targetHandle": "l", "data": { "flow": "features", "payload": "lookup velocity features", "steps": [2], "bidirectional": true } },
+    { "id": "e-risk-rules", "source": "risk-api", "sourceHandle": "r", "target": "rules", "targetHandle": "l", "data": { "flow": "decision", "payload": "score + features", "steps": [4, 6], "bidirectional": true } },
+    { "id": "e-rules-review", "source": "rules", "sourceHandle": "t", "target": "review", "targetHandle": "l", "data": { "flow": "review", "payload": "grey-zone case", "steps": [5] } },
+    { "id": "e-review-labels", "source": "review", "sourceHandle": "b", "target": "labels", "targetHandle": "t", "data": { "flow": "learning", "payload": "analyst verdicts", "steps": [7] } },
+    { "id": "e-labels-training", "source": "labels", "sourceHandle": "r", "target": "training", "targetHandle": "b", "data": { "flow": "learning", "payload": "mature labels", "steps": [7, 8] } },
+    { "id": "e-training-model", "source": "training", "sourceHandle": "t", "target": "model", "targetHandle": "t", "data": { "flow": "learning", "payload": "deploy (shadow → canary)", "steps": [8] } }
+  ]
+}

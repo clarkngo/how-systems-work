@@ -1,0 +1,223 @@
+{
+  "schemaVersion": 1,
+  "id": "cdn",
+  "title": "Content Delivery Network",
+  "summary": "A CDN puts copies of your content in hundreds of data centres close to users, so most requests never travel to your servers. DNS or anycast steers each user to a nearby edge. The edge serves from cache when it can, and on a miss it asks a regional shield tier, so the origin sees one request instead of thousands.",
+  "flows": {
+    "routing": { "label": "Request routing", "color": "#fbbf24" },
+    "request": { "label": "Content request", "color": "#38bdf8" },
+    "control": { "label": "Config & purge (control plane)", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Find the nearest edge", "text": "The browser resolves cdn.example.com. Anycast (one IP announced from every location) or a geo-aware DNS answer sends the user to a nearby point of presence (PoP)." },
+    { "step": 2, "title": "Terminate TLS at the edge", "text": "The edge completes the TLS handshake a few milliseconds away instead of across an ocean, then builds a cache key from host, path, and selected headers or query params." },
+    { "step": 3, "title": "Cache miss goes to the shield", "text": "If the edge does not have the object, it asks a regional shield PoP instead of the origin. Many edges share one shield, which raises the hit ratio." },
+    { "step": 4, "title": "Shield fetches from origin", "text": "Only on a shield miss does the request reach the origin. Concurrent misses for the same object are coalesced into one origin fetch." },
+    { "step": 5, "title": "Push config and purges", "text": "Customers change rules or purge content through the control plane. Changes reach every PoP worldwide in seconds." },
+    { "step": 6, "title": "Serve and cache the response", "text": "The edge stores the object for its TTL (from Cache-Control) and returns it. With stale-while-revalidate, users get the old copy instantly while the edge refreshes it in the background." }
+  ],
+  "nodes": [
+    {
+      "id": "user",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "User / Browser",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["HTTP/2 / HTTP/3", "Browser cache"],
+        "io": {
+          "input": [{ "name": "Page assets", "type": "<img src=\"https://cdn.example.com/hero.webp\">" }],
+          "output": [{ "name": "Request", "type": "GET /hero.webp, Accept-Encoding: br, If-None-Match" }]
+        },
+        "responsibilities": [
+          "Resolves the CDN hostname and connects to whichever IP DNS returns.",
+          "Reuses its own cache and revalidates with ETags so unchanged files cost a tiny 304.",
+          "Benefits from HTTP/3 (QUIC), which avoids head-of-line blocking on lossy mobile networks."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Long-cached file changed without a new URL",
+            "impact": "Users keep seeing the old CSS or JS for days.",
+            "mitigation": "Fingerprinted file names (app.3f9a.js) with a long max-age; short TTL on HTML."
+          },
+          {
+            "scenario": "Resolver far from the user",
+            "impact": "Geo-DNS picks a distant PoP.",
+            "mitigation": "Anycast routing, or EDNS Client Subnet so DNS sees the user's real location."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dns",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "DNS / Anycast Routing",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Anycast BGP", "GeoDNS"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "A/AAAA cdn.example.com" }],
+          "output": [{ "name": "Answer", "type": "IP of the best PoP (TTL 30-300 s)" }]
+        },
+        "responsibilities": [
+          "Steers each user to a healthy PoP that is close in network terms.",
+          "Takes overloaded or failed PoPs out of rotation within seconds.",
+          "Absorbs DDoS traffic by spreading it across every anycast location."
+        ],
+        "failureModes": [
+          {
+            "scenario": "BGP route leak or misconfiguration",
+            "impact": "Traffic lands in the wrong region or is black-holed.",
+            "mitigation": "RPKI route validation, staged route changes, and monitoring from many vantage points."
+          },
+          {
+            "scenario": "PoP fails but DNS answers are cached",
+            "impact": "Users keep connecting to a dead PoP until the TTL expires.",
+            "mitigation": "Anycast withdraws the route instantly; short TTLs for DNS-based steering."
+          }
+        ]
+      }
+    },
+    {
+      "id": "control",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Control Plane",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Config API", "Global pub/sub"],
+        "io": {
+          "input": [{ "name": "Change", "type": "Purge /products/*, or rule: cache /api/* for 10 s" }],
+          "output": [{ "name": "Rollout", "type": "Versioned config + purge events pushed to every PoP" }]
+        },
+        "responsibilities": [
+          "Stores customer config: cache rules, TLS certificates, WAF rules, edge functions.",
+          "Pushes purges worldwide in seconds, by URL, prefix, or surrogate-key tag.",
+          "Rolls out config gradually so a bad rule cannot take down every PoP at once."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bad config pushed globally",
+            "impact": "Every PoP breaks at the same moment, a global outage.",
+            "mitigation": "Canary PoPs first, automatic rollback on error spikes, kill switch for edge code."
+          },
+          {
+            "scenario": "Purge storm",
+            "impact": "Everything is evicted and the origin is flooded with misses.",
+            "mitigation": "Prefer tag-based purges; soft purge (mark stale) so stale-while-revalidate still works."
+          }
+        ]
+      }
+    },
+    {
+      "id": "edge",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "Edge PoP Cache",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Varnish / ATS / Nginx", "NVMe + RAM tiers", "Edge functions"],
+        "io": {
+          "input": [{ "name": "Request", "type": "HTTPS GET + cache key (host + path + vary headers)" }],
+          "output": [
+            { "name": "Hit", "type": "200/304 from cache, Age: 120, X-Cache: HIT" },
+            { "name": "Miss", "type": "Forwarded GET to shield" }
+          ]
+        },
+        "responsibilities": [
+          "Terminates TLS close to the user and serves cached objects in a few milliseconds.",
+          "Builds cache keys carefully: varying on too many headers splits the cache into useless fragments.",
+          "Runs WAF rules, redirects, and small edge functions before anything reaches the origin."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cache key includes a random query param (utm_*, session id)",
+            "impact": "Every request is a miss; hit ratio collapses.",
+            "mitigation": "Normalise and strip unneeded params; allowlist the headers used for Vary."
+          },
+          {
+            "scenario": "Personalised page cached and served to others",
+            "impact": "One user's account page shown to strangers, a data leak.",
+            "mitigation": "Cache-Control: private on personalised responses; never cache responses with Set-Cookie."
+          }
+        ]
+      }
+    },
+    {
+      "id": "shield",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Origin Shield",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Tiered caching", "Request coalescing"],
+        "io": {
+          "input": [{ "name": "Edge misses", "type": "GETs from many PoPs in the region" }],
+          "output": [{ "name": "Origin fetch", "type": "One GET per object per TTL" }]
+        },
+        "responsibilities": [
+          "Acts as a large shared cache between the edges and the origin.",
+          "Coalesces concurrent misses for the same object into a single origin request.",
+          "Serves stale content if the origin is down (stale-if-error)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Shield PoP fails",
+            "impact": "All edges in the region send misses straight to the origin.",
+            "mitigation": "Fail over to a secondary shield; rate-limit origin fetches."
+          },
+          {
+            "scenario": "Thundering herd when a hot object expires",
+            "impact": "Thousands of simultaneous origin fetches.",
+            "mitigation": "Request coalescing, plus refreshing just before expiry."
+          }
+        ]
+      }
+    },
+    {
+      "id": "origin",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Origin Server",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["App servers", "S3 bucket"],
+        "io": {
+          "input": [{ "name": "Fetch", "type": "GET /hero.webp (only from shield IPs)" }],
+          "output": [{ "name": "Response", "type": "200 + Cache-Control: public, max-age=31536000 + ETag" }]
+        },
+        "responsibilities": [
+          "Holds the source of truth for every file and page.",
+          "Decides cacheability with Cache-Control, Surrogate-Control, and Vary headers.",
+          "Accepts traffic only from the CDN so attackers cannot bypass it."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Origin outage",
+            "impact": "Uncached and expired content fails to load.",
+            "mitigation": "stale-if-error serves the last good copy; multi-region origin."
+          },
+          {
+            "scenario": "Origin IP exposed",
+            "impact": "Attackers hit it directly, bypassing CDN DDoS protection.",
+            "mitigation": "Firewall to CDN IP ranges only, or a private tunnel or mTLS from the CDN."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-user-dns", "source": "user", "sourceHandle": "t", "target": "dns", "targetHandle": "l", "data": { "flow": "routing", "payload": "resolve → nearest PoP", "steps": [1], "bidirectional": true } },
+    { "id": "e-user-edge", "source": "user", "sourceHandle": "r", "target": "edge", "targetHandle": "l", "data": { "flow": "request", "payload": "HTTPS GET ⇄ cached object", "steps": [2, 6], "bidirectional": true } },
+    { "id": "e-edge-shield", "source": "edge", "sourceHandle": "r", "target": "shield", "targetHandle": "l", "data": { "flow": "request", "payload": "cache miss", "steps": [3, 6], "bidirectional": true } },
+    { "id": "e-shield-origin", "source": "shield", "sourceHandle": "r", "target": "origin", "targetHandle": "l", "data": { "flow": "request", "payload": "coalesced fetch", "steps": [4], "bidirectional": true } },
+    { "id": "e-control-edge", "source": "control", "sourceHandle": "r", "target": "edge", "targetHandle": "b", "data": { "flow": "control", "payload": "config + purges", "steps": [5] } }
+  ]
+}

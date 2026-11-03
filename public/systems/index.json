@@ -16,7 +16,7 @@
     { "id": "hotel-booking", "title": "Hotel & Travel Booking", "category": "Commerce & Marketplaces", "file": null, "description": "Availability search, inventory holds, and supplier integrations." },
 
     { "id": "payment-gateway", "title": "Payment Gateway", "category": "Fintech", "file": "payment-gateway.json", "description": "Card authorization, 3-D Secure, capture, settlement, and webhooks." },
-    { "id": "fraud-detection", "title": "Real-Time Fraud Detection", "category": "Fintech", "file": null, "description": "Feature lookups, risk scoring, and rule engines in the payment hot path." },
+    { "id": "fraud-detection", "title": "Real-Time Fraud Detection", "category": "Fintech", "file": "fraud-detection.json", "description": "Feature lookups, risk scoring, and rule engines in the payment hot path." },
     { "id": "ledger", "title": "Double-Entry Ledger", "category": "Fintech", "file": null, "description": "Immutable journal entries, balances, idempotency, and reconciliation." },
     { "id": "digital-wallet", "title": "Digital Wallet & P2P Transfers", "category": "Fintech", "file": null, "description": "Balances, transfers, KYC, and money movement between banks." },
     { "id": "stock-exchange", "title": "Stock Exchange Matching Engine", "category": "Fintech", "file": null, "description": "Order books, price-time matching, market data feeds, and clearing." },
@@ -24,7 +24,7 @@
 
     { "id": "auth-flow", "title": "Authentication (OIDC)", "category": "Security & Identity", "file": "auth-flow.json", "description": "Login, authorization code + PKCE, tokens, refresh, and sessions." },
     { "id": "enterprise-sso", "title": "Enterprise SSO (SAML)", "category": "Security & Identity", "file": null, "description": "Identity provider federation, assertions, and user provisioning (SCIM)." },
-    { "id": "api-rate-limiter", "title": "API Rate Limiter", "category": "Security & Identity", "file": null, "description": "Token buckets, distributed counters, and quota enforcement at the edge." },
+    { "id": "api-rate-limiter", "title": "API Rate Limiter", "category": "Security & Identity", "file": "api-rate-limiter.json", "description": "Token buckets, distributed counters, and quota enforcement at the edge." },
     { "id": "secrets-management", "title": "Secrets Management", "category": "Security & Identity", "file": null, "description": "Vaults, envelope encryption, rotation, and short-lived credentials." },
     { "id": "authorization", "title": "Fine-Grained Authorization", "category": "Security & Identity", "file": null, "description": "Relationship-based access control (Zanzibar-style) policy checks." },
 
@@ -36,13 +36,13 @@
 
     { "id": "chat-messaging", "title": "Chat & Messaging", "category": "Social & Media", "file": "chat-messaging.json", "description": "Persistent connections, message fan-out, delivery receipts, and presence." },
     { "id": "news-feed", "title": "Social News Feed", "category": "Social & Media", "file": null, "description": "Fan-out on write vs read, ranking, and timeline caching." },
-    { "id": "notifications", "title": "Notification System", "category": "Social & Media", "file": null, "description": "Push, email, and SMS routing with preferences, batching, and retries." },
-    { "id": "video-streaming", "title": "Video Streaming (VOD)", "category": "Social & Media", "file": null, "description": "Transcoding ladders, adaptive bitrate, DRM, and CDN delivery." },
+    { "id": "notifications", "title": "Notification System", "category": "Social & Media", "file": "notifications.json", "description": "Push, email, and SMS routing with preferences, batching, and retries." },
+    { "id": "video-streaming", "title": "Video Streaming (VOD)", "category": "Social & Media", "file": "video-streaming.json", "description": "Transcoding ladders, adaptive bitrate, DRM, and CDN delivery." },
     { "id": "live-streaming", "title": "Live Streaming", "category": "Social & Media", "file": null, "description": "Ingest, real-time transcoding, low-latency delivery, and live chat." },
     { "id": "collaborative-editing", "title": "Collaborative Editing", "category": "Social & Media", "file": null, "description": "CRDTs / operational transforms, presence, and conflict-free sync." },
     { "id": "email-delivery", "title": "Email Delivery", "category": "Social & Media", "file": null, "description": "SMTP, SPF/DKIM/DMARC, sender reputation, and bounce handling." },
 
-    { "id": "cdn", "title": "Content Delivery Network", "category": "Infrastructure", "file": null, "description": "Edge caching, origin shielding, cache keys, and invalidation." },
+    { "id": "cdn", "title": "Content Delivery Network", "category": "Infrastructure", "file": "cdn.json", "description": "Edge caching, origin shielding, cache keys, and invalidation." },
     { "id": "dns-resolution", "title": "DNS Resolution", "category": "Infrastructure", "file": null, "description": "Recursive resolvers, authoritative servers, TTLs, and anycast." },
     { "id": "load-balancer", "title": "Load Balancing", "category": "Infrastructure", "file": null, "description": "L4 vs L7, health checks, connection draining, and consistent hashing." },
     { "id": "kubernetes-deploy", "title": "Kubernetes Deployment", "category": "Infrastructure", "file": null, "description": "API server, scheduler, kubelet, controllers, and rolling updates." },

@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "id": "api-rate-limiter",
+  "title": "API Rate Limiter",
+  "summary": "A rate limiter protects an API from overload and abuse by capping how often each caller can make requests. The gateway identifies every request, looks up the matching limit, and does an atomic check-and-decrement in a shared counter store. The request is either forwarded or rejected with 429 Too Many Requests, and usage data feeds back into the rules.",
+  "flows": {
+    "request": { "label": "Request path", "color": "#38bdf8" },
+    "check": { "label": "Limit check", "color": "#fbbf24" },
+    "config": { "label": "Rules & feedback", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Identify the caller", "text": "A request arrives at the gateway. It extracts a key: API key, user ID, OAuth client, or IP address for anonymous traffic." },
+    { "step": 2, "title": "Look up the rule", "text": "The gateway matches the request to a rule from its locally cached config, for example free tier 100 req/min, POST /login 5/min per IP, or a 10k req/s global ceiling." },
+    { "step": 3, "title": "Atomic check", "text": "A Lua script in Redis refills the caller's token bucket based on elapsed time and takes one token if available. Doing both in one atomic step stops concurrent requests racing past the limit." },
+    { "step": 4, "title": "Forward or reject", "text": "If a token was available the request goes to the backend. If not, the gateway answers 429 immediately, which costs the backend nothing." },
+    { "step": 5, "title": "Tell the client", "text": "Every response carries RateLimit headers (limit, remaining, reset), and a 429 includes Retry-After, so well-behaved clients back off instead of hammering." },
+    { "step": 6, "title": "Record usage", "text": "Allowed and rejected counts stream to analytics for billing, dashboards, and abuse detection." },
+    { "step": 7, "title": "Adjust the rules", "text": "Operators, or automated abuse detection, tighten limits or block keys. New rules reach every gateway within seconds." }
+  ],
+  "nodes": [
+    {
+      "id": "config",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Rules Config",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["etcd / Consul / DB", "Pushed to gateways"],
+        "io": {
+          "input": [{ "name": "Rule change", "type": "{ match: 'tier=free', limit: 100, window: '1m' }" }],
+          "output": [{ "name": "Ruleset", "type": "Versioned rules cached in gateway memory" }]
+        },
+        "responsibilities": [
+          "Stores limits per tier, per endpoint, per customer, and global ceilings.",
+          "Pushes changes to gateways so rule lookups never need a network call.",
+          "Keeps per-customer overrides for enterprise contracts."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Typo sets a limit to 0",
+            "impact": "Every customer on that tier gets 429s.",
+            "mitigation": "Validation, staged rollout, and a dry-run (shadow) mode that logs without blocking."
+          },
+          {
+            "scenario": "Config store unavailable",
+            "impact": "Rules cannot be changed.",
+            "mitigation": "Gateways keep the last good ruleset in memory and continue enforcing it."
+          }
+        ]
+      }
+    },
+    {
+      "id": "clients",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "API Clients",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["SDKs", "Retry with backoff"],
+        "io": {
+          "input": [{ "name": "Response", "type": "200 or 429 + RateLimit-Remaining + Retry-After" }],
+          "output": [{ "name": "Request", "type": "GET /v1/orders, Authorization: Bearer sk_..." }]
+        },
+        "responsibilities": [
+          "Calls the API, from mobile apps to partner servers to scripts.",
+          "Should respect Retry-After and back off exponentially with jitter.",
+          "Watches remaining quota to pace batch jobs."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Client retries 429s in a tight loop",
+            "impact": "Retries multiply load; the limiter is busy rejecting the same caller.",
+            "mitigation": "SDK retries with backoff and jitter; escalating blocks for repeat offenders."
+          },
+          {
+            "scenario": "Many users behind one NAT or office IP",
+            "impact": "Innocent users share one IP limit and get blocked.",
+            "mitigation": "Limit by authenticated identity where possible; IP limits only as a loose backstop."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "API Gateway / Limiter",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Envoy / Kong / NGINX", "Local token cache"],
+        "io": {
+          "input": [{ "name": "Request", "type": "HTTP request + identity (key, user, IP)" }],
+          "output": [
+            { "name": "Check", "type": "EVALSHA bucket.lua key=rl:{client}:{rule} cost=1" },
+            { "name": "Decision", "type": "Forward, or 429 + Retry-After: 12" }
+          ]
+        },
+        "responsibilities": [
+          "Identifies the caller and the matching rule for every request.",
+          "Enforces the decision before the request reaches any backend.",
+          "Fails open or closed per rule when the counter store is unreachable."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Redis unreachable",
+            "impact": "Fail closed blocks all traffic; fail open removes protection.",
+            "mitigation": "Fail open with a local in-memory limiter as a rough fallback; fail closed only for sensitive endpoints like login."
+          },
+          {
+            "scenario": "Extra round trip on every request",
+            "impact": "Adds about 1 ms of latency to each request.",
+            "mitigation": "Same-zone Redis, pipelining, or locally leased token batches synced periodically."
+          }
+        ]
+      }
+    },
+    {
+      "id": "counters",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Counter Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Redis Cluster", "Lua scripts"],
+        "io": {
+          "input": [{ "name": "Check", "type": "key + cost + now" }],
+          "output": [{ "name": "Result", "type": "{ allowed: true, remaining: 41, resetMs: 18000 }" }]
+        },
+        "responsibilities": [
+          "Holds token buckets or sliding-window counters for each caller.",
+          "Refills and decrements atomically in one Lua call, so there is no read-then-write race.",
+          "Expires idle keys automatically (TTL) to bound memory."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hot key: one huge customer on one shard",
+            "impact": "That shard saturates and adds latency for everyone on it.",
+            "mitigation": "Split the key into sub-buckets across shards, or give big customers local leased quotas."
+          },
+          {
+            "scenario": "Fixed windows reset at :00",
+            "impact": "Caller sends 2× the limit across a window boundary.",
+            "mitigation": "Use a token bucket or sliding-window counter instead of fixed windows."
+          }
+        ]
+      }
+    },
+    {
+      "id": "backend",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Backend Services",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Microservices", "Load shedding"],
+        "io": {
+          "input": [{ "name": "Allowed request", "type": "Forwarded HTTP + X-Client-Id" }],
+          "output": [{ "name": "Response", "type": "Business response, passed back through the gateway" }]
+        },
+        "responsibilities": [
+          "Serves only traffic that passed the limiter.",
+          "Sheds load itself when overloaded, as a second line of defence.",
+          "Reports saturation so global limits can be tuned."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Limits set above real capacity",
+            "impact": "Every caller is within limits but the backend still falls over.",
+            "mitigation": "Global concurrency limits derived from load tests; adaptive limits driven by latency."
+          },
+          {
+            "scenario": "Expensive endpoints counted the same as cheap ones",
+            "impact": "A few heavy report queries exhaust capacity.",
+            "mitigation": "Cost-based limiting: each request consumes tokens proportional to its cost."
+          }
+        ]
+      }
+    },
+    {
+      "id": "analytics",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Usage & Abuse Analytics",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Kafka", "ClickHouse"],
+        "io": {
+          "input": [{ "name": "Decisions", "type": "{ client, rule, allowed, ts } stream" }],
+          "output": [{ "name": "Actions", "type": "Usage for billing, alerts, and auto-block rules" }]
+        },
+        "responsibilities": [
+          "Aggregates usage per customer for billing and quota dashboards.",
+          "Detects abuse patterns such as credential stuffing and scraping.",
+          "Proposes or applies rule changes such as temporary blocks."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Auto-block rule misfires",
+            "impact": "A big legitimate customer is blocked during a traffic spike.",
+            "mitigation": "Allowlists, time-limited blocks, and human approval for blocking high-value keys."
+          },
+          {
+            "scenario": "Usage events dropped",
+            "impact": "Billing is under-counted.",
+            "mitigation": "Durable log with at-least-once delivery; reconcile against gateway counters."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-clients-gateway", "source": "clients", "sourceHandle": "r", "target": "gateway", "targetHandle": "l", "data": { "flow": "request", "payload": "request ⇄ 200 / 429", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-config-gateway", "source": "config", "sourceHandle": "r", "target": "gateway", "targetHandle": "t", "data": { "flow": "config", "payload": "rules (cached)", "steps": [2] } },
+    { "id": "e-gateway-counters", "source": "gateway", "sourceHandle": "r", "target": "counters", "targetHandle": "l", "data": { "flow": "check", "payload": "atomic token bucket", "steps": [3], "bidirectional": true } },
+    { "id": "e-gateway-backend", "source": "gateway", "sourceHandle": "b", "target": "backend", "targetHandle": "l", "data": { "flow": "request", "payload": "allowed requests", "steps": [4] } },
+    { "id": "e-counters-analytics", "source": "counters", "sourceHandle": "r", "target": "analytics", "targetHandle": "l", "data": { "flow": "config", "payload": "usage stream", "steps": [6] } },
+    { "id": "e-analytics-config", "source": "analytics", "sourceHandle": "t", "target": "config", "targetHandle": "t", "data": { "flow": "config", "payload": "tighten / block", "steps": [7] } }
+  ]
+}
