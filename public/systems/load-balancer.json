@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "id": "load-balancer",
+  "title": "Load Balancing",
+  "summary": "Load balancing spreads traffic over many servers so no single one is overwhelmed and any one can fail without users noticing. It happens in layers. DNS picks a region, a fast Layer 4 balancer spreads raw TCP connections, and a Layer 7 proxy that understands HTTP picks a healthy backend for each request. Health checks keep broken servers out of rotation.",
+  "flows": {
+    "request": { "label": "Request path", "color": "#38bdf8" },
+    "routing": { "label": "Global routing", "color": "#fbbf24" },
+    "health": { "label": "Health & discovery", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "DNS picks a region", "text": "The client resolves api.example.com. Global server load balancing (GSLB) returns the virtual IP (VIP) of the closest healthy region, or an anycast IP announced everywhere." },
+    { "step": 2, "title": "L4 spreads connections", "text": "The TCP connection reaches a Layer 4 balancer. It hashes the 5-tuple (source/dest IP and port, protocol) with consistent hashing so every packet of a connection lands on the same proxy, even if a balancer instance changes." },
+    { "step": 3, "title": "L7 terminates TLS and routes", "text": "The Layer 7 proxy decrypts TLS, reads the HTTP request, and picks a route from the host, path, and headers, for example /api/orders → orders-service." },
+    { "step": 4, "title": "Pick a backend", "text": "Within the pool, it uses power-of-two-choices: sample two healthy backends and send to the one with fewer in-flight requests. This beats round-robin when requests vary in cost." },
+    { "step": 5, "title": "Timeouts, retries, circuit breaking", "text": "Each request has a deadline. Safe requests retry once on another backend within a retry budget, and a backend with too many failures is temporarily ejected." },
+    { "step": 6, "title": "Health checks", "text": "Active probes hit /healthz every few seconds and outlier detection watches real error rates. Failing backends leave the pool and return only after passing again." },
+    { "step": 7, "title": "Drain during deploys", "text": "Before a backend shuts down it is marked draining: no new requests, but in-flight ones finish. Rolling deploys then cause zero errors." }
+  ],
+  "nodes": [
+    {
+      "id": "clients",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Clients",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Browsers, mobile apps, partners"],
+        "io": {
+          "input": [{ "name": "Response", "type": "HTTP response from whichever backend served it" }],
+          "output": [{ "name": "Request", "type": "HTTPS to api.example.com" }]
+        },
+        "responsibilities": [
+          "Resolve the hostname and open connections to the VIP.",
+          "Reuse connections (keep-alive, HTTP/2) to avoid repeated handshakes.",
+          "Retry idempotent requests with backoff on connection errors."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Client caches DNS far beyond TTL",
+            "impact": "Keeps sending traffic to a drained or failed region.",
+            "mitigation": "Anycast VIPs that move without DNS changes; keep old regions serving during cutover."
+          },
+          {
+            "scenario": "Long-lived connections pin to old backends",
+            "impact": "New servers get no traffic after scale-up.",
+            "mitigation": "Cap connection lifetime; balance per request at L7, not per connection."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dns",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Global DNS / GSLB",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Route 53 / NS1", "Anycast"],
+        "io": {
+          "input": [{ "name": "Query", "type": "A api.example.com" }],
+          "output": [{ "name": "Answer", "type": "VIP of nearest healthy region (TTL 60 s)" }]
+        },
+        "responsibilities": [
+          "Routes users to a region by latency, geography, or weight.",
+          "Removes a region from answers when its health checks fail.",
+          "Enables gradual traffic shifts between regions."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Region fails but cached answers persist",
+            "impact": "Some users keep failing until TTLs expire.",
+            "mitigation": "Short TTLs plus anycast, or client-side fallback hosts."
+          },
+          {
+            "scenario": "All traffic failed over to one region",
+            "impact": "The survivor is overloaded and fails too, a cascading failure.",
+            "mitigation": "Keep enough spare capacity in each region (N+1) and shed load at the edge."
+          }
+        ]
+      }
+    },
+    {
+      "id": "l4",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "L4 Load Balancer",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Maglev / Katran / AWS NLB", "ECMP + consistent hashing"],
+        "io": {
+          "input": [{ "name": "Packets", "type": "TCP/UDP to VIP:443" }],
+          "output": [{ "name": "Forwarded", "type": "Same connection always to the same L7 proxy" }]
+        },
+        "responsibilities": [
+          "Spreads millions of connections per second without reading HTTP.",
+          "Keeps each connection on one proxy using consistent hashing on the 5-tuple.",
+          "Often uses direct server return: replies skip the balancer entirely."
+        ],
+        "failureModes": [
+          {
+            "scenario": "L4 instance added or removed",
+            "impact": "With naive hashing, live connections are reset.",
+            "mitigation": "Consistent hashing (Maglev table) plus connection tracking keeps most flows stable."
+          },
+          {
+            "scenario": "SYN flood",
+            "impact": "Connection tables fill and legitimate users are refused.",
+            "mitigation": "SYN cookies, stateless designs, and upstream DDoS scrubbing."
+          }
+        ]
+      }
+    },
+    {
+      "id": "l7",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "L7 Proxy",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Envoy / NGINX / HAProxy", "P2C least-request"],
+        "io": {
+          "input": [{ "name": "HTTP request", "type": "Decrypted request: host, path, headers" }],
+          "output": [{ "name": "Upstream call", "type": "To a chosen backend in the matching pool, with deadline" }]
+        },
+        "responsibilities": [
+          "Terminates TLS and routes by host, path, header, or weight (canaries).",
+          "Picks backends by load, not just turn order.",
+          "Enforces timeouts, retry budgets, and circuit breakers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retry storm",
+            "impact": "Every layer retries 3×, multiplying load on a struggling service.",
+            "mitigation": "Retry budgets (e.g. at most 10% extra) and retry only at one layer."
+          },
+          {
+            "scenario": "Round-robin onto a slow backend",
+            "impact": "It keeps receiving its share and its queue grows.",
+            "mitigation": "Least-request or latency-aware balancing; outlier ejection."
+          }
+        ]
+      }
+    },
+    {
+      "id": "backends",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Backend Pool",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Stateless service instances", "Autoscaling group"],
+        "io": {
+          "input": [{ "name": "Request", "type": "HTTP from proxy + X-Request-Id" }],
+          "output": [{ "name": "Response", "type": "Business response; /healthz status" }]
+        },
+        "responsibilities": [
+          "Serve requests without relying on local session state, so any instance can serve anyone.",
+          "Report readiness separately from liveness.",
+          "Finish in-flight work when asked to drain."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Sticky sessions stored in instance memory",
+            "impact": "Losing an instance logs users out; load cannot rebalance.",
+            "mitigation": "Store sessions externally (Redis) or in signed tokens."
+          },
+          {
+            "scenario": "Health check passes but real requests fail",
+            "impact": "Broken instance stays in the pool.",
+            "mitigation": "Deep readiness checks and passive outlier detection on real traffic."
+          }
+        ]
+      }
+    },
+    {
+      "id": "health",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Health Checks & Discovery",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Active probes", "Service registry (Consul / k8s)"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Probe results, deploy events, autoscaling changes" }],
+          "output": [{ "name": "Endpoints", "type": "Healthy backend list pushed to proxies" }]
+        },
+        "responsibilities": [
+          "Probes every backend and tracks pass/fail streaks.",
+          "Publishes the current healthy endpoint set to all proxies.",
+          "Marks instances draining during deploys and scale-in."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Checker network partition marks everything unhealthy",
+            "impact": "Proxies have no backends: a full outage caused by monitoring.",
+            "mitigation": "Panic threshold: if most hosts look unhealthy, keep routing to all of them."
+          },
+          {
+            "scenario": "Flapping instance",
+            "impact": "Joins and leaves the pool constantly.",
+            "mitigation": "Require several consecutive passes to rejoin; hold-down timers."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-clients-dns", "source": "clients", "sourceHandle": "t", "target": "dns", "targetHandle": "l", "data": { "flow": "routing", "payload": "resolve → regional VIP", "steps": [1], "bidirectional": true } },
+    { "id": "e-clients-l4", "source": "clients", "sourceHandle": "r", "target": "l4", "targetHandle": "l", "data": { "flow": "request", "payload": "TCP/TLS to VIP", "steps": [2], "bidirectional": true } },
+    { "id": "e-l4-l7", "source": "l4", "sourceHandle": "r", "target": "l7", "targetHandle": "l", "data": { "flow": "request", "payload": "5-tuple hash", "steps": [2, 3] } },
+    { "id": "e-l7-backends", "source": "l7", "sourceHandle": "r", "target": "backends", "targetHandle": "l", "data": { "flow": "request", "payload": "P2C pick · retry · drain", "steps": [4, 5, 7], "bidirectional": true } },
+    { "id": "e-health-backends", "source": "health", "sourceHandle": "t", "target": "backends", "targetHandle": "b", "data": { "flow": "health", "payload": "probe /healthz", "steps": [6], "bidirectional": true } },
+    { "id": "e-health-l7", "source": "health", "sourceHandle": "l", "target": "l7", "targetHandle": "b", "data": { "flow": "health", "payload": "healthy endpoints", "steps": [6, 7] } }
+  ]
+}
