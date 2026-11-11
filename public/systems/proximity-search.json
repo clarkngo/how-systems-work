@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "id": "proximity-search",
+  "title": "Nearby Search",
+  "summary": "'Coffee near me' sounds simple, but checking the distance to millions of places on every request is far too slow. Nearby search divides the world into a hierarchy of cells (geohashes or S2 cells), indexes every place by the cell it is in, and answers a query by looking up only the few cells that cover the search circle. Exact distance filtering and ranking then run on that small candidate set.",
+  "flows": {
+    "query": { "label": "Query", "color": "#38bdf8" },
+    "index": { "label": "Geo index lookup", "color": "#fbbf24" },
+    "update": { "label": "Place updates", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Search near a location", "text": "The app sends lat 47.6097, lng -122.3331, radius 1 km, query 'coffee', and filters such as open now." },
+    { "step": 2, "title": "Cover the circle with cells", "text": "The API computes the set of cells covering the 1 km circle at a suitable level. With geohashes, nearby points share a prefix such as c23nb. Neighbouring cells are included so places just across a cell edge are not missed." },
+    { "step": 3, "title": "Look up candidates", "text": "The geo index returns all coffee places in those cells. The API then computes the exact distance (haversine) and drops anything outside the circle." },
+    { "step": 4, "title": "Load details", "text": "Names, hours, ratings, and photos for the remaining few hundred candidates are fetched in a batch from the place-details store and cache." },
+    { "step": 5, "title": "Rank", "text": "Candidates are scored by distance, rating, popularity, open-now status, and personal relevance, not distance alone." },
+    { "step": 6, "title": "Return results", "text": "The top 20 are returned with a cursor. If too few results are found, the API widens the radius and searches again." },
+    { "step": 7, "title": "Keep the index current", "text": "New places, moves, and closures from owners and data providers update both the details store and the geo index, re-filing a place under its new cell." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Device location", "Map + list views"],
+        "io": {
+          "input": [{ "name": "Results", "type": "Places with distance, rating, open status" }],
+          "output": [{ "name": "Query", "type": "{ lat, lng, radius: 1000, q: 'coffee', openNow }" }]
+        },
+        "responsibilities": [
+          "Sends the user's location (with permission) and filters.",
+          "Re-queries as the map moves, with debouncing.",
+          "Shows results on a map and in a list."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Inaccurate location indoors",
+            "impact": "Results centred on the wrong block.",
+            "mitigation": "Use reported accuracy; let users adjust the pin."
+          },
+          {
+            "scenario": "Query on every map pan",
+            "impact": "Load spikes.",
+            "mitigation": "Debounce and cache by cell on the client."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Nearby Search API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Stateless service", "Geohash / S2 math"],
+        "io": {
+          "input": [{ "name": "Query", "type": "Point + radius + filters" }],
+          "output": [{ "name": "Page", "type": "Top 20 ranked places + cursor" }]
+        },
+        "responsibilities": [
+          "Covers the search circle with cells at the right level.",
+          "Filters candidates by exact distance.",
+          "Widens the radius when results are sparse."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Only searching the user's own cell",
+            "impact": "Misses a café 20 m away across a cell boundary.",
+            "mitigation": "Always include neighbouring cells in the covering."
+          },
+          {
+            "scenario": "Dense city cell holds 50,000 places",
+            "impact": "Slow queries in downtowns.",
+            "mitigation": "Finer cell levels where density is high (adaptive, like a quadtree)."
+          }
+        ]
+      }
+    },
+    {
+      "id": "geoindex",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Geospatial Index",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Geohash / S2 cell IDs", "Redis GEO / Elasticsearch geo"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "cells [c23nb2, c23nb3, …] + category" }],
+          "output": [{ "name": "Candidates", "type": "Place IDs with lat/lng in those cells" }]
+        },
+        "responsibilities": [
+          "Maps each cell to the places inside it.",
+          "Uses cell IDs that sort by space, so nearby cells are range scans.",
+          "Shards by region for scale."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Shard for a big city overloaded",
+            "impact": "Slow searches there.",
+            "mitigation": "Split hot regions; read replicas."
+          },
+          {
+            "scenario": "Places near the antimeridian or poles",
+            "impact": "Cell maths edge cases.",
+            "mitigation": "S2 cells on a sphere avoid most projection edge cases."
+          }
+        ]
+      }
+    },
+    {
+      "id": "details",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Place Details",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Document DB", "Cache"],
+        "io": {
+          "input": [{ "name": "Batch get", "type": "Place IDs" }],
+          "output": [{ "name": "Details", "type": "Name, hours, rating, photos, price level" }]
+        },
+        "responsibilities": [
+          "Stores rich place data separately from the slim geo index.",
+          "Serves batch lookups quickly from cache.",
+          "Computes open-now from hours and time zone."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Stale hours or closed businesses",
+            "impact": "Users sent to a closed café.",
+            "mitigation": "Owner updates, user reports, and 'possibly closed' signals."
+          },
+          {
+            "scenario": "Details store slow",
+            "impact": "Results missing names or photos.",
+            "mitigation": "Return slim results; load details lazily."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ranker",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Ranking",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Learning-to-rank", "Distance decay"],
+        "io": {
+          "input": [{ "name": "Candidates", "type": "Places + distance + details + user context" }],
+          "output": [{ "name": "Ordered list", "type": "Scores combining distance, quality, relevance" }]
+        },
+        "responsibilities": [
+          "Balances closeness against quality and relevance.",
+          "Boosts places that are open now and match the query well.",
+          "Personalises lightly from past behaviour."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Pure distance ranking",
+            "impact": "A closed or poorly rated place ranks first.",
+            "mitigation": "Blend signals; demote closed places."
+          },
+          {
+            "scenario": "Popularity feedback loop",
+            "impact": "New places never surface.",
+            "mitigation": "Freshness boosts and exploration."
+          }
+        ]
+      }
+    },
+    {
+      "id": "updates",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Place Updates",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["Owner dashboard", "Data providers"],
+        "io": {
+          "input": [{ "name": "Changes", "type": "New place, moved, closed, hours changed" }],
+          "output": [{ "name": "Index updates", "type": "Re-file under new cell; update details" }]
+        },
+        "responsibilities": [
+          "Brings in new and changed places from owners and providers.",
+          "Deduplicates the same place from multiple sources.",
+          "Updates the index and details together."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Duplicate listings",
+            "impact": "Same café shown three times.",
+            "mitigation": "Entity matching on name, address, and location."
+          },
+          {
+            "scenario": "Spam listings (fake locksmiths)",
+            "impact": "Users scammed.",
+            "mitigation": "Verification for categories prone to fraud."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-api", "source": "app", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "query", "payload": "nearby ⇄ results", "steps": [1, 6], "bidirectional": true } },
+    { "id": "e-api-geoindex", "source": "api", "sourceHandle": "t", "target": "geoindex", "targetHandle": "l", "data": { "flow": "index", "payload": "covering cells → candidates", "steps": [2, 3], "bidirectional": true } },
+    { "id": "e-api-details", "source": "api", "sourceHandle": "b", "target": "details", "targetHandle": "l", "data": { "flow": "query", "payload": "batch details", "steps": [4], "bidirectional": true } },
+    { "id": "e-api-ranker", "source": "api", "sourceHandle": "r", "target": "ranker", "targetHandle": "l", "data": { "flow": "query", "payload": "score + order", "steps": [5], "bidirectional": true } },
+    { "id": "e-updates-geoindex", "source": "updates", "sourceHandle": "t", "target": "geoindex", "targetHandle": "t", "data": { "flow": "update", "payload": "re-index places", "steps": [7] } }
+  ]
+}

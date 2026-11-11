@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "id": "authorization",
+  "title": "Fine-Grained Authorization",
+  "summary": "Fine-grained authorization answers 'can Anne view this document?' when the answer depends on relationships: she is in a group that is an editor of the folder that contains the document. Inspired by Google's Zanzibar, the system stores relationship tuples, uses a schema to define how relations imply each other, and evaluates checks by walking that graph quickly and consistently, so a user removed from a document cannot still see it a second later.",
+  "flows": {
+    "check": { "label": "Permission check", "color": "#38bdf8" },
+    "write": { "label": "Relationship writes", "color": "#a78bfa" },
+    "derived": { "label": "Indexes & watch", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Share a document", "text": "Bob shares the readme with the eng team. The app writes a tuple: doc:readme#viewer@group:eng#member." },
+    { "step": 2, "title": "Store with a consistency token", "text": "The tuple is committed with a timestamp, and a consistency token ('zookie') is returned. The app stores it alongside the document's content version." },
+    { "step": 3, "title": "Check access", "text": "Anne opens the document. The app calls check(doc:readme, view, user:anne) and passes the document's zookie." },
+    { "step": 4, "title": "Expand with the schema", "text": "The schema says view = viewer + editor + parent folder's viewers. The service evaluates these rewrite rules, fanning out subproblems in parallel." },
+    { "step": 5, "title": "Read at a snapshot", "text": "Tuples are read at a snapshot at least as new as the zookie. That solves the 'new enemy' problem: someone removed before the content change cannot see the new content." },
+    { "step": 6, "title": "Use precomputed group membership", "text": "Deeply nested groups (team ⊂ org ⊂ company) are flattened into a precomputed index, so membership checks are fast set lookups instead of long graph walks." },
+    { "step": 7, "title": "Stream changes downstream", "text": "A Watch API streams tuple changes so search indexes and caches can filter results by permission without calling check for every item." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Application",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Docs / Drive / any service", "Authz SDK"],
+        "io": {
+          "input": [{ "name": "Answers", "type": "allowed: true/false · zookie" }],
+          "output": [{ "name": "Calls", "type": "write(tuple) · check(object, permission, subject, zookie)" }]
+        },
+        "responsibilities": [
+          "Writes relationships whenever sharing or membership changes.",
+          "Checks permission before every protected read or action.",
+          "Stores zookies with content versions."
+        ],
+        "failureModes": [
+          {
+            "scenario": "App checks its own copy of permissions",
+            "impact": "Inconsistent answers across products.",
+            "mitigation": "One central authorization service for all products."
+          },
+          {
+            "scenario": "Forgot to check on a new endpoint",
+            "impact": "Data leak.",
+            "mitigation": "Deny-by-default middleware and tests for every route."
+          }
+        ]
+      }
+    },
+    {
+      "id": "authz",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Authorization Service",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["SpiceDB / OpenFGA / Zanzibar", "Request hedging"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Check, write, expand, lookup-resources" }],
+          "output": [{ "name": "Decision", "type": "Allowed / denied in ~10 ms at p95" }]
+        },
+        "responsibilities": [
+          "Evaluates checks by walking the relationship graph.",
+          "Caches and deduplicates concurrent subproblems.",
+          "Honours consistency tokens on every read."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Very deep or wide graph",
+            "impact": "Slow checks, timeouts.",
+            "mitigation": "Depth limits, flattened group indexes, parallel fan-out."
+          },
+          {
+            "scenario": "Service down",
+            "impact": "Every product fails closed: nobody can open anything.",
+            "mitigation": "Multi-region replicas; aggressive caching for zookie-free checks."
+          }
+        ]
+      }
+    },
+    {
+      "id": "schema",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Namespace Schema",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Relation definitions", "Version-controlled"],
+        "io": {
+          "input": [{ "name": "Definition", "type": "definition doc { relation parent: folder; relation viewer: user | group#member }" }],
+          "output": [{ "name": "Rewrites", "type": "permission view = viewer + editor + parent->view" }]
+        },
+        "responsibilities": [
+          "Defines object types, relations, and how permissions derive from them.",
+          "Keeps policy logic out of application code.",
+          "Is validated and tested before deployment."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Schema change widens access",
+            "impact": "Users suddenly see data they should not.",
+            "mitigation": "Schema tests with expected allow/deny assertions in CI."
+          },
+          {
+            "scenario": "Removing a relation still in use",
+            "impact": "Checks break across products.",
+            "mitigation": "Migration checks that no tuples use a relation before it is removed."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tuples",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Relationship Tuple Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Spanner / CockroachDB", "MVCC snapshots"],
+        "io": {
+          "input": [{ "name": "Write", "type": "doc:readme#viewer@group:eng#member" }],
+          "output": [{ "name": "Read", "type": "Tuples for an object at snapshot T" }]
+        },
+        "responsibilities": [
+          "Stores billions of relationship tuples durably.",
+          "Serves reads at a chosen snapshot timestamp.",
+          "Keeps a changelog of every write."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Reading a stale replica without a token",
+            "impact": "A removed user briefly keeps access (new enemy problem).",
+            "mitigation": "Read at a snapshot no older than the content's zookie."
+          },
+          {
+            "scenario": "Hot object (company-wide group)",
+            "impact": "Hotspot on one key range.",
+            "mitigation": "Caching and the flattened membership index."
+          }
+        ]
+      }
+    },
+    {
+      "id": "watch",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Watch Consumers",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Change stream", "Search ACL filters"],
+        "io": {
+          "input": [{ "name": "Changes", "type": "Ordered tuple writes and deletes" }],
+          "output": [{ "name": "Derived data", "type": "Search permission filters, cache invalidations" }]
+        },
+        "responsibilities": [
+          "Keeps search and listing indexes permission-aware.",
+          "Invalidates caches when relationships change.",
+          "Feeds audit trails of access changes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Consumer lags",
+            "impact": "Search shows items a user just lost access to.",
+            "mitigation": "Post-filter search results with check; alert on lag."
+          },
+          {
+            "scenario": "Missed events after restart",
+            "impact": "Index permanently wrong.",
+            "mitigation": "Resume from a stored revision; periodic full rebuilds."
+          }
+        ]
+      }
+    },
+    {
+      "id": "index",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Group Membership Index",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Leopard-style flattening", "In-memory sets"],
+        "io": {
+          "input": [{ "name": "Membership changes", "type": "group:eng#member@group:backend#member" }],
+          "output": [{ "name": "Fast lookup", "type": "Is user:anne in group:company (transitively)?" }]
+        },
+        "responsibilities": [
+          "Precomputes transitive group membership.",
+          "Turns deep recursive checks into set intersections.",
+          "Updates incrementally as tuples change."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Index rebuild after corruption",
+            "impact": "Slower checks until it is rebuilt.",
+            "mitigation": "Fall back to graph walking; rebuild from the tuple store."
+          },
+          {
+            "scenario": "Huge groups (whole company)",
+            "impact": "Memory blowup.",
+            "mitigation": "Special-case public or company-wide grants as wildcards."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-authz", "source": "app", "sourceHandle": "r", "target": "authz", "targetHandle": "l", "data": { "flow": "check", "payload": "write / check ⇄ allowed + zookie", "steps": [1, 3], "bidirectional": true } },
+    { "id": "e-authz-schema", "source": "authz", "sourceHandle": "t", "target": "schema", "targetHandle": "l", "data": { "flow": "check", "payload": "rewrite rules", "steps": [4] } },
+    { "id": "e-authz-tuples", "source": "authz", "sourceHandle": "b", "target": "tuples", "targetHandle": "l", "data": { "flow": "write", "payload": "write → zookie · read at snapshot", "steps": [2, 5], "bidirectional": true } },
+    { "id": "e-tuples-index", "source": "tuples", "sourceHandle": "r", "target": "index", "targetHandle": "l", "data": { "flow": "derived", "payload": "flatten groups", "steps": [6] } },
+    { "id": "e-tuples-watch", "source": "tuples", "sourceHandle": "r", "target": "watch", "targetHandle": "l", "data": { "flow": "derived", "payload": "Watch changelog", "steps": [7] } }
+  ]
+}

@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "hotel-booking",
+  "title": "Hotel & Travel Booking",
+  "summary": "A booking site sells rooms it does not own. Availability and prices live in thousands of hotel and supplier systems that are slow, rate-limited, and sometimes wrong, so search runs mostly on a cache and the live supplier is checked only when it matters. Booking is a multi-step saga across systems: hold the room, take payment, confirm with the supplier, and undo each step cleanly if a later one fails.",
+  "flows": {
+    "search": { "label": "Search", "color": "#38bdf8" },
+    "booking": { "label": "Booking saga", "color": "#34d399" },
+    "supplier": { "label": "Supplier calls", "color": "#fbbf24" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Search", "text": "A traveller searches Lisbon, 12-15 March, 2 adults. Thousands of hotels may match." },
+    { "step": 2, "title": "Answer from the availability cache", "text": "Results come from a cache of rates and availability that suppliers push or that is refreshed by polling, so search takes milliseconds without calling every hotel." },
+    { "step": 3, "title": "Verify the live price", "text": "When the traveller opens a hotel or starts checkout, a real-time call to the supplier confirms the exact rate. A cached price can be stale, and showing a different total at payment loses trust." },
+    { "step": 4, "title": "Start the booking and hold the room", "text": "The booking service creates a booking in PENDING state with an idempotency key and asks the supplier to hold the room for a few minutes." },
+    { "step": 5, "title": "Authorise payment", "text": "The card is authorised (not yet captured) for the total, with 3-D Secure if required." },
+    { "step": 6, "title": "Confirm with the supplier", "text": "The supplier confirms and returns a confirmation number, the booking becomes CONFIRMED, and payment is captured. If confirmation fails, the saga releases the hold and voids the authorisation." },
+    { "step": 7, "title": "Send the itinerary", "text": "The traveller receives the confirmation email and itinerary. Later changes and cancellations follow the same saga pattern with refunds." }
+  ],
+  "nodes": [
+    {
+      "id": "traveller",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Traveller",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Web / mobile"],
+        "io": {
+          "input": [{ "name": "Results", "type": "Hotels, rates, confirmation" }],
+          "output": [{ "name": "Requests", "type": "Search, select room, book" }]
+        },
+        "responsibilities": [
+          "Searches, compares, and books.",
+          "Expects the price shown to be the price charged.",
+          "Gets a confirmation they can trust at check-in."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Double-click on Book",
+            "impact": "Two bookings and two charges.",
+            "mitigation": "Idempotency key per checkout session."
+          },
+          {
+            "scenario": "Price changes at the payment step",
+            "impact": "Cart abandonment and complaints.",
+            "mitigation": "Re-verify the price on hotel page view and before payment."
+          }
+        ]
+      }
+    },
+    {
+      "id": "search",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Search & Pricing API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Geo + date search", "Ranking"],
+        "io": {
+          "input": [{ "name": "Query", "type": "{ city, checkIn, checkOut, guests }" }],
+          "output": [{ "name": "Offers", "type": "Ranked hotels with cached rates; live-verified on select" }]
+        },
+        "responsibilities": [
+          "Finds matching hotels and ranks them by relevance and value.",
+          "Uses cached availability for broad search, live checks for detail.",
+          "Applies markups, taxes, and currency conversion."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Live-checking every result",
+            "impact": "Suppliers rate-limit or ban you; search is slow.",
+            "mitigation": "Cache for search, live calls only for the few hotels a user opens."
+          },
+          {
+            "scenario": "Look-to-book ratio too high",
+            "impact": "Suppliers charge for excessive lookups.",
+            "mitigation": "Smart caching and request budgets per supplier."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cache",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Availability Cache",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Rate & inventory grid", "Supplier push (ARI)"],
+        "io": {
+          "input": [{ "name": "Updates", "type": "Availability, rates, and inventory pushed by channel managers" }],
+          "output": [{ "name": "Lookup", "type": "Rooms + price per night for the date range" }]
+        },
+        "responsibilities": [
+          "Stores availability by hotel × room × date.",
+          "Absorbs search volume so suppliers are not called.",
+          "Tracks freshness per entry."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Stale 'available' rooms",
+            "impact": "Bookings fail at confirmation.",
+            "mitigation": "Short TTLs for hot dates; invalidate on failed bookings."
+          },
+          {
+            "scenario": "Supplier push feed breaks",
+            "impact": "Whole chain shows outdated prices.",
+            "mitigation": "Monitor feed freshness; fall back to polling."
+          }
+        ]
+      }
+    },
+    {
+      "id": "suppliers",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Suppliers & Channel Managers",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Hotel PMS / GDS / wholesalers", "XML & REST APIs"],
+        "io": {
+          "input": [{ "name": "Calls", "type": "Price check, hold, confirm, cancel" }],
+          "output": [{ "name": "Responses", "type": "Live rate, hold ID, confirmation number" }]
+        },
+        "responsibilities": [
+          "Own the real inventory and prices.",
+          "Hold and confirm rooms on request.",
+          "Enforce rate limits and cancellation policies."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Timeout on confirm (did it book?)",
+            "impact": "Booked at the hotel but not in your system, or the reverse.",
+            "mitigation": "Idempotent confirm with your booking reference; reconcile by querying status."
+          },
+          {
+            "scenario": "Supplier outage",
+            "impact": "No bookings for its hotels.",
+            "mitigation": "Multiple suppliers for the same hotel; hide unbookable offers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "booking",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Booking Service (Saga)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["State machine", "Compensating actions"],
+        "io": {
+          "input": [{ "name": "Book", "type": "{ offerId, guest, payment, idempotencyKey }" }],
+          "output": [{ "name": "Booking", "type": "PENDING → HELD → PAID → CONFIRMED (or rolled back)" }]
+        },
+        "responsibilities": [
+          "Runs the booking as a series of steps, each with an undo action.",
+          "Persists state after every step so a crash can resume.",
+          "Reconciles uncertain outcomes with suppliers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Crash between payment and confirm",
+            "impact": "Charged with no room, or a room with no payment.",
+            "mitigation": "Durable workflow (e.g. Temporal) that resumes or compensates."
+          },
+          {
+            "scenario": "Compensation itself fails",
+            "impact": "Holds or authorisations left dangling.",
+            "mitigation": "Retry compensations; holds and authorisations also expire on their own."
+          }
+        ]
+      }
+    },
+    {
+      "id": "payments",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Payments",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Authorise / capture / void", "3-D Secure"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Authorise €480 · capture · void · refund" }],
+          "output": [{ "name": "Result", "type": "auth_id, captured, voided" }]
+        },
+        "responsibilities": [
+          "Reserves funds before the supplier confirms.",
+          "Captures only after a confirmed booking.",
+          "Voids or refunds when the saga rolls back."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Capture before confirmation",
+            "impact": "Refund needed when the supplier fails.",
+            "mitigation": "Authorise first, capture only on CONFIRMED."
+          },
+          {
+            "scenario": "Currency mismatch",
+            "impact": "Customer charged a different amount than shown.",
+            "mitigation": "Lock the FX rate at quote time."
+          }
+        ]
+      }
+    },
+    {
+      "id": "notify",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Confirmations & Itinerary",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Email / push", "Itinerary service"],
+        "io": {
+          "input": [{ "name": "Event", "type": "BookingConfirmed { confirmationNo, dates }" }],
+          "output": [{ "name": "Messages", "type": "Confirmation email, calendar file, reminders" }]
+        },
+        "responsibilities": [
+          "Sends confirmations with supplier reference numbers.",
+          "Keeps the itinerary updated on changes.",
+          "Reminds travellers before check-in."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Confirmation email lost",
+            "impact": "Panicked traveller calls support.",
+            "mitigation": "Booking also visible in the account; resend option."
+          },
+          {
+            "scenario": "Hotel never received the booking",
+            "impact": "No room at check-in.",
+            "mitigation": "Reconfirm with the hotel days before arrival."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-traveller-search", "source": "traveller", "sourceHandle": "r", "target": "search", "targetHandle": "l", "data": { "flow": "search", "payload": "search ⇄ offers", "steps": [1], "bidirectional": true } },
+    { "id": "e-search-cache", "source": "search", "sourceHandle": "t", "target": "cache", "targetHandle": "l", "data": { "flow": "search", "payload": "cached availability", "steps": [2], "bidirectional": true } },
+    { "id": "e-search-suppliers", "source": "search", "sourceHandle": "b", "target": "suppliers", "targetHandle": "l", "data": { "flow": "supplier", "payload": "live price check", "steps": [3], "bidirectional": true } },
+    { "id": "e-search-booking", "source": "search", "sourceHandle": "r", "target": "booking", "targetHandle": "l", "data": { "flow": "booking", "payload": "book offer", "steps": [4] } },
+    { "id": "e-booking-suppliers", "source": "booking", "sourceHandle": "b", "target": "suppliers", "targetHandle": "r", "data": { "flow": "supplier", "payload": "hold → confirm", "steps": [4, 6], "bidirectional": true } },
+    { "id": "e-booking-payments", "source": "booking", "sourceHandle": "r", "target": "payments", "targetHandle": "l", "data": { "flow": "booking", "payload": "authorise → capture", "steps": [5, 6], "bidirectional": true } },
+    { "id": "e-booking-notify", "source": "booking", "sourceHandle": "r", "target": "notify", "targetHandle": "l", "data": { "flow": "booking", "payload": "BookingConfirmed", "steps": [7] } }
+  ]
+}

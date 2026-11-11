@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "id": "enterprise-sso",
+  "title": "Enterprise SSO (SAML)",
+  "summary": "Enterprise single sign-on lets employees use one company login for hundreds of SaaS apps, and lets IT cut off all access in one place when someone leaves. With SAML, the app redirects the browser to the company's identity provider, which authenticates the user against the directory with MFA and posts back a signed assertion the app verifies. SCIM provisioning then creates and removes accounts in each app automatically.",
+  "flows": {
+    "login": { "label": "SAML login", "color": "#38bdf8" },
+    "verify": { "label": "Authentication", "color": "#fbbf24" },
+    "provisioning": { "label": "SCIM provisioning", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Open the app", "text": "An employee visits acme.slack.com. The app sees no session and recognises the company domain, so it uses SSO." },
+    { "step": 2, "title": "Redirect to the identity provider", "text": "The app redirects the browser to the company's IdP (Okta, Entra ID) with a SAML AuthnRequest: who is asking and where to send the answer." },
+    { "step": 3, "title": "Authenticate with MFA", "text": "If the employee has no IdP session, the IdP checks their password against the directory and requires MFA (push or a FIDO2 security key). Device and location policies apply." },
+    { "step": 4, "title": "Post a signed assertion", "text": "The IdP returns an HTML form that auto-posts a SAML Response to the app's Assertion Consumer Service URL. It contains a signed assertion with the user's email, groups, and a short validity window." },
+    { "step": 5, "title": "App validates and creates a session", "text": "The app verifies the XML signature with the IdP's certificate and checks audience, recipient, expiry, and replay, then logs the user in." },
+    { "step": 6, "title": "Provision with SCIM", "text": "When HR adds a hire or changes their team, the directory change flows through SCIM: the app's account and group memberships are created or updated before the person's first day." },
+    { "step": 7, "title": "Offboard in one place", "text": "When someone leaves, disabling them in the directory kills IdP sessions and SCIM deactivates every app account, so access ends everywhere within minutes." }
+  ],
+  "nodes": [
+    {
+      "id": "user",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Employee Browser",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Browser redirects", "Security key / authenticator"],
+        "io": {
+          "input": [{ "name": "Redirects", "type": "302 to IdP · auto-POST form back to app" }],
+          "output": [{ "name": "Login", "type": "Credentials + MFA to the IdP only" }]
+        },
+        "responsibilities": [
+          "Carries messages between the app and the IdP via redirects and posts.",
+          "Enters credentials only on the IdP, never on each app.",
+          "Holds IdP and app session cookies."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Phishing page imitates the IdP",
+            "impact": "Credentials and MFA codes stolen.",
+            "mitigation": "Phishing-resistant MFA (FIDO2/WebAuthn) bound to the real domain."
+          },
+          {
+            "scenario": "Clock skew on the user's machine",
+            "impact": "Rarely matters: validity is checked on servers.",
+            "mitigation": "Server-side time checks with small allowed skew."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sp",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "SaaS App (Service Provider)",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["SAML SP library", "SCIM endpoint"],
+        "io": {
+          "input": [{ "name": "Assertion", "type": "Signed SAML Response (POST /saml/acs)" }],
+          "output": [{ "name": "Session", "type": "App session for jane@acme.com with groups" }]
+        },
+        "responsibilities": [
+          "Starts SSO and trusts only assertions signed by the configured IdP.",
+          "Maps IdP groups to app roles.",
+          "Accepts SCIM calls to create, update, and deactivate users."
+        ],
+        "failureModes": [
+          {
+            "scenario": "XML signature wrapping attack",
+            "impact": "Attacker logs in as anyone.",
+            "mitigation": "Mature SAML libraries; verify the signed element is the one used."
+          },
+          {
+            "scenario": "Local passwords still allowed",
+            "impact": "Leavers keep access through a password login.",
+            "mitigation": "Enforce SSO-only login for the company domain."
+          }
+        ]
+      }
+    },
+    {
+      "id": "idp",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Identity Provider",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Okta / Entra ID", "SAML + OIDC", "Signing keys"],
+        "io": {
+          "input": [{ "name": "AuthnRequest", "type": "From an app, via the browser" }],
+          "output": [{ "name": "Assertion", "type": "Signed: subject, email, groups, NotOnOrAfter +5 min" }]
+        },
+        "responsibilities": [
+          "Authenticates users once and issues assertions to every app.",
+          "Applies access policies: MFA, device health, location.",
+          "Rotates signing certificates and publishes metadata."
+        ],
+        "failureModes": [
+          {
+            "scenario": "IdP outage",
+            "impact": "No one can log in to anything.",
+            "mitigation": "Highly available IdP, long-enough app sessions, break-glass accounts."
+          },
+          {
+            "scenario": "Signing certificate expires",
+            "impact": "Every app rejects logins.",
+            "mitigation": "Track expiry; publish the new cert in metadata ahead of rotation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "directory",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Corporate Directory",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Active Directory / LDAP", "HR system as source"],
+        "io": {
+          "input": [{ "name": "HR events", "type": "Hire, transfer, termination" }],
+          "output": [{ "name": "Identity", "type": "User, password check, groups, status" }]
+        },
+        "responsibilities": [
+          "Is the source of truth for who works here and in which teams.",
+          "Verifies primary credentials.",
+          "Drives joiner, mover, and leaver changes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Termination not entered promptly",
+            "impact": "Ex-employee keeps access.",
+            "mitigation": "HR system integration that triggers deprovisioning automatically."
+          },
+          {
+            "scenario": "Group sprawl",
+            "impact": "Users accumulate access they no longer need.",
+            "mitigation": "Periodic access reviews and role-based groups."
+          }
+        ]
+      }
+    },
+    {
+      "id": "mfa",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "MFA & Device Trust",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["WebAuthn / push", "Device posture"],
+        "io": {
+          "input": [{ "name": "Challenge", "type": "Verify jane on this device" }],
+          "output": [{ "name": "Result", "type": "Verified + device managed/compliant" }]
+        },
+        "responsibilities": [
+          "Proves possession of a second factor.",
+          "Checks the device is managed and patched.",
+          "Raises requirements for risky logins."
+        ],
+        "failureModes": [
+          {
+            "scenario": "MFA fatigue (spammed push prompts)",
+            "impact": "User approves an attacker's login.",
+            "mitigation": "Number matching or FIDO2; rate-limit prompts."
+          },
+          {
+            "scenario": "Lost security key",
+            "impact": "Employee locked out.",
+            "mitigation": "Second registered key; verified helpdesk recovery."
+          }
+        ]
+      }
+    },
+    {
+      "id": "scim",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "SCIM Provisioning",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["SCIM 2.0", "Push from IdP"],
+        "io": {
+          "input": [{ "name": "Change", "type": "User or group change in the directory" }],
+          "output": [{ "name": "SCIM calls", "type": "POST /Users · PATCH active:false · /Groups" }]
+        },
+        "responsibilities": [
+          "Creates app accounts before first login.",
+          "Keeps group memberships in sync.",
+          "Deactivates accounts in every app on offboarding."
+        ],
+        "failureModes": [
+          {
+            "scenario": "SCIM push fails silently for one app",
+            "impact": "Leaver still has an active account there.",
+            "mitigation": "Retry with alerting; periodic full reconciliation."
+          },
+          {
+            "scenario": "Deleting instead of deactivating",
+            "impact": "Leaver's data and documents lost.",
+            "mitigation": "Deactivate first; transfer ownership before deletion."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-user-sp", "source": "user", "sourceHandle": "t", "target": "sp", "targetHandle": "l", "data": { "flow": "login", "payload": "visit ⇄ session", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-user-idp", "source": "user", "sourceHandle": "b", "target": "idp", "targetHandle": "l", "data": { "flow": "login", "payload": "AuthnRequest ⇄ SAML Response", "steps": [2, 4], "bidirectional": true } },
+    { "id": "e-idp-directory", "source": "idp", "sourceHandle": "r", "target": "directory", "targetHandle": "l", "data": { "flow": "verify", "payload": "password + groups", "steps": [3], "bidirectional": true } },
+    { "id": "e-idp-mfa", "source": "idp", "sourceHandle": "b", "target": "mfa", "targetHandle": "b", "data": { "flow": "verify", "payload": "MFA challenge", "steps": [3], "bidirectional": true } },
+    { "id": "e-directory-scim", "source": "directory", "sourceHandle": "t", "target": "scim", "targetHandle": "b", "data": { "flow": "provisioning", "payload": "joiner / leaver", "steps": [6, 7] } },
+    { "id": "e-scim-sp", "source": "scim", "sourceHandle": "l", "target": "sp", "targetHandle": "r", "data": { "flow": "provisioning", "payload": "create / deactivate", "steps": [6, 7] } }
+  ]
+}

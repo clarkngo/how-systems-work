@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "clickstream-analytics",
+  "title": "Real-Time Analytics",
+  "summary": "Real-time analytics turns a firehose of user events into dashboards that are seconds old. Events are collected and appended to a durable log. A stream processor aggregates them in time windows, handling events that arrive late or out of order, and loads the results into a column-oriented OLAP store built to answer slice-and-dice queries in under a second. Raw events are kept in a data lake for reprocessing and deep analysis.",
+  "flows": {
+    "ingest": { "label": "Ingestion", "color": "#38bdf8" },
+    "stream": { "label": "Stream processing", "color": "#34d399" },
+    "batch": { "label": "Raw history", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Track events", "text": "SDKs in web and mobile apps send events such as page_view and add_to_cart with user, session, device, and timestamp, batched to save battery and bandwidth." },
+    { "step": 2, "title": "Collect and validate", "text": "Collectors validate the schema, drop bots, add geo and campaign data, and append events to Kafka, partitioned by user so each user's events stay in order." },
+    { "step": 3, "title": "Aggregate in windows", "text": "A stream processor computes per-minute counts, unique users (HyperLogLog), and funnels. Watermarks decide how long to wait for late events before closing a window." },
+    { "step": 4, "title": "Archive raw events", "text": "Every raw event is also written to the data lake as Parquet. This is the replayable source for backfills, fixes, and new metrics." },
+    { "step": 5, "title": "Load the OLAP store", "text": "Rollups stream into a columnar OLAP database (Druid, Pinot, ClickHouse) that is indexed by time and dimensions." },
+    { "step": 6, "title": "Serve live dashboards", "text": "Dashboards query 'signups by country, last 30 minutes' and get answers in under a second, refreshed every few seconds." },
+    { "step": 7, "title": "Explore full history", "text": "Analysts run ad-hoc SQL over months of raw events in the lake for questions the rollups did not anticipate." }
+  ],
+  "nodes": [
+    {
+      "id": "clients",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Tracking SDKs",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Web / iOS / Android SDKs", "Server-side events"],
+        "io": {
+          "input": [{ "name": "User actions", "type": "Clicks, views, purchases" }],
+          "output": [{ "name": "Events", "type": "{ event, userId, anonId, props, ts } batched" }]
+        },
+        "responsibilities": [
+          "Capture events with a consistent, versioned schema.",
+          "Batch, compress, and retry with local buffering.",
+          "Respect consent settings before tracking."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ad blockers drop client events",
+            "impact": "Undercounted traffic.",
+            "mitigation": "First-party collection domain; send key events server-side."
+          },
+          {
+            "scenario": "Inconsistent event names across teams",
+            "impact": "Metrics that cannot be trusted or joined.",
+            "mitigation": "Tracking plan with schema registry and CI validation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "collector",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Event Collector",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Stateless HTTP fleet", "Schema validation"],
+        "io": {
+          "input": [{ "name": "Batches", "type": "POST /collect (gzip JSON)" }],
+          "output": [{ "name": "Records", "type": "Validated, enriched events to Kafka" }]
+        },
+        "responsibilities": [
+          "Accepts very high event volume and acknowledges quickly.",
+          "Validates, filters bots, and enriches with geo and campaign data.",
+          "Routes invalid events to a quarantine topic, not the bin."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Traffic spike (Super Bowl ad)",
+            "impact": "Collectors overloaded; events dropped.",
+            "mitigation": "Autoscaling with headroom; clients retry with backoff."
+          },
+          {
+            "scenario": "Schema change breaks validation",
+            "impact": "A new app version's events are all rejected.",
+            "mitigation": "Quarantine and alert; backward-compatible schema evolution."
+          }
+        ]
+      }
+    },
+    {
+      "id": "kafka",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "Event Log",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Kafka", "Partitioned by user"],
+        "io": {
+          "input": [{ "name": "Events", "type": "Append-only records" }],
+          "output": [{ "name": "Consumers", "type": "Stream processor, lake sink, other teams" }]
+        },
+        "responsibilities": [
+          "Buffers and durably stores events between producers and consumers.",
+          "Lets many consumers read the same stream independently.",
+          "Allows replay for a retention window."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Consumers fall behind retention",
+            "impact": "Unprocessed events deleted.",
+            "mitigation": "Lag alerts; lake sink as the long-term copy."
+          },
+          {
+            "scenario": "Skewed partitions (one huge bot user)",
+            "impact": "One partition lags.",
+            "mitigation": "Bot filtering upstream; rebalance keys."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stream",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Stream Processor",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Flink", "Event-time windows", "Exactly-once state"],
+        "io": {
+          "input": [{ "name": "Events", "type": "Ordered per partition, late arrivals possible" }],
+          "output": [{ "name": "Rollups", "type": "Per-minute metrics by dimension" }]
+        },
+        "responsibilities": [
+          "Aggregates by event time, not arrival time.",
+          "Uses watermarks to bound how long to wait for late events.",
+          "Checkpoints state for exactly-once results."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Mobile events arrive hours late (offline)",
+            "impact": "Windows already closed; counts wrong.",
+            "mitigation": "Allowed lateness with updates; correct later from the lake."
+          },
+          {
+            "scenario": "State grows unbounded (distinct users)",
+            "impact": "Checkpoints slow, then job crashes.",
+            "mitigation": "Approximate structures (HyperLogLog) and state TTLs."
+          }
+        ]
+      }
+    },
+    {
+      "id": "lake",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Raw Event Lake",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["S3 + Parquet / Iceberg", "Partitioned by date"],
+        "io": {
+          "input": [{ "name": "Raw events", "type": "Hourly files from the sink" }],
+          "output": [{ "name": "History", "type": "Months of queryable raw data" }]
+        },
+        "responsibilities": [
+          "Keeps the complete raw history cheaply.",
+          "Is the source for backfills and reprocessing.",
+          "Supports ad-hoc SQL and ML feature building."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Millions of tiny files",
+            "impact": "Queries crawl.",
+            "mitigation": "Compaction jobs into large files."
+          },
+          {
+            "scenario": "PII stored indefinitely",
+            "impact": "Privacy and deletion-request problems.",
+            "mitigation": "Pseudonymise IDs; deletion pipelines; retention limits."
+          }
+        ]
+      }
+    },
+    {
+      "id": "olap",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Real-Time OLAP Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Druid / Pinot / ClickHouse", "Columnar + bitmap indexes"],
+        "io": {
+          "input": [{ "name": "Stream ingest", "type": "Rollups queryable within seconds" }],
+          "output": [{ "name": "Query results", "type": "GROUP BY country over last 30 min in < 1 s" }]
+        },
+        "responsibilities": [
+          "Answers filter-and-aggregate queries in sub-second time.",
+          "Makes streamed data queryable within seconds.",
+          "Partitions by time for fast recent-data queries."
+        ],
+        "failureModes": [
+          {
+            "scenario": "High-cardinality dimension (URL with IDs)",
+            "impact": "Index and memory explosion.",
+            "mitigation": "Normalise dimensions; keep raw detail in the lake."
+          },
+          {
+            "scenario": "Expensive dashboard query storm",
+            "impact": "Cluster slows for everyone.",
+            "mitigation": "Query quotas, result caching, pre-aggregated tables."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dashboards",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Dashboards & Analysts",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Superset / Grafana", "SQL notebooks"],
+        "io": {
+          "input": [{ "name": "Data", "type": "Live rollups + historical raw events" }],
+          "output": [{ "name": "Insight", "type": "Live KPIs, funnels, alerts, ad-hoc answers" }]
+        },
+        "responsibilities": [
+          "Show live product and business metrics.",
+          "Alert on sudden drops (checkout broken?).",
+          "Support deep dives over full history."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Real-time and batch numbers disagree",
+            "impact": "Nobody trusts either.",
+            "mitigation": "Shared metric definitions; label data freshness; reconcile daily."
+          },
+          {
+            "scenario": "Dashboard sprawl",
+            "impact": "Conflicting versions of the same metric.",
+            "mitigation": "Certified metrics layer with owners."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-clients-collector", "source": "clients", "sourceHandle": "r", "target": "collector", "targetHandle": "l", "data": { "flow": "ingest", "payload": "batched events", "steps": [1] } },
+    { "id": "e-collector-kafka", "source": "collector", "sourceHandle": "r", "target": "kafka", "targetHandle": "l", "data": { "flow": "ingest", "payload": "validated + enriched", "steps": [2] } },
+    { "id": "e-kafka-stream", "source": "kafka", "sourceHandle": "t", "target": "stream", "targetHandle": "l", "data": { "flow": "stream", "payload": "event-time windows", "steps": [3] } },
+    { "id": "e-kafka-lake", "source": "kafka", "sourceHandle": "b", "target": "lake", "targetHandle": "l", "data": { "flow": "batch", "payload": "raw archive", "steps": [4] } },
+    { "id": "e-stream-olap", "source": "stream", "sourceHandle": "r", "target": "olap", "targetHandle": "l", "data": { "flow": "stream", "payload": "rollups", "steps": [5] } },
+    { "id": "e-olap-dashboards", "source": "olap", "sourceHandle": "b", "target": "dashboards", "targetHandle": "t", "data": { "flow": "stream", "payload": "sub-second queries", "steps": [6], "bidirectional": true } },
+    { "id": "e-lake-dashboards", "source": "lake", "sourceHandle": "r", "target": "dashboards", "targetHandle": "l", "data": { "flow": "batch", "payload": "ad-hoc SQL", "steps": [7], "bidirectional": true } }
+  ]
+}
