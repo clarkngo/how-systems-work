@@ -5,7 +5,7 @@
     { "id": "llm-serving", "title": "LLM Inference Serving", "category": "AI & Machine Learning", "file": "llm-serving.json", "description": "GPU batching, KV cache, token streaming, and autoscaling." },
     { "id": "recommendation-engine", "title": "Recommendation Engine", "category": "AI & Machine Learning", "file": "recommendation-engine.json", "description": "Candidate generation, ranking, and real-time feedback signals." },
     { "id": "ml-training-pipeline", "title": "ML Training & Feature Store", "category": "AI & Machine Learning", "file": null, "description": "Offline/online features, training jobs, model registry, and deployment." },
-    { "id": "content-moderation", "title": "Content Moderation Pipeline", "category": "AI & Machine Learning", "file": null, "description": "Classifiers, human review queues, and appeals at scale." },
+    { "id": "content-moderation", "title": "Content Moderation Pipeline", "category": "AI & Machine Learning", "file": "content-moderation.json", "description": "Classifiers, human review queues, and appeals at scale." },
 
     { "id": "ecommerce-checkout", "title": "E-Commerce Checkout", "category": "Commerce & Marketplaces", "file": "ecommerce-checkout.json", "description": "Cart, pricing, tax, inventory reservation, payment, and order creation." },
     { "id": "inventory-orders", "title": "Inventory & Order Management", "category": "Commerce & Marketplaces", "file": "inventory-orders.json", "description": "Stock across warehouses, reservations, fulfilment, and returns." },
@@ -19,13 +19,13 @@
     { "id": "fraud-detection", "title": "Real-Time Fraud Detection", "category": "Fintech", "file": "fraud-detection.json", "description": "Feature lookups, risk scoring, and rule engines in the payment hot path." },
     { "id": "ledger", "title": "Double-Entry Ledger", "category": "Fintech", "file": "ledger.json", "description": "Immutable journal entries, balances, idempotency, and reconciliation." },
     { "id": "digital-wallet", "title": "Digital Wallet & P2P Transfers", "category": "Fintech", "file": null, "description": "Balances, transfers, KYC, and money movement between banks." },
-    { "id": "stock-exchange", "title": "Stock Exchange Matching Engine", "category": "Fintech", "file": null, "description": "Order books, price-time matching, market data feeds, and clearing." },
-    { "id": "subscription-billing", "title": "Subscription Billing", "category": "Fintech", "file": null, "description": "Plans, metering, proration, invoicing, and dunning." },
+    { "id": "stock-exchange", "title": "Stock Exchange Matching Engine", "category": "Fintech", "file": "stock-exchange.json", "description": "Order books, price-time matching, market data feeds, and clearing." },
+    { "id": "subscription-billing", "title": "Subscription Billing", "category": "Fintech", "file": "subscription-billing.json", "description": "Plans, metering, proration, invoicing, and dunning." },
 
     { "id": "auth-flow", "title": "Authentication (OIDC)", "category": "Security & Identity", "file": "auth-flow.json", "description": "Login, authorization code + PKCE, tokens, refresh, and sessions." },
     { "id": "enterprise-sso", "title": "Enterprise SSO (SAML)", "category": "Security & Identity", "file": null, "description": "Identity provider federation, assertions, and user provisioning (SCIM)." },
     { "id": "api-rate-limiter", "title": "API Rate Limiter", "category": "Security & Identity", "file": "api-rate-limiter.json", "description": "Token buckets, distributed counters, and quota enforcement at the edge." },
-    { "id": "secrets-management", "title": "Secrets Management", "category": "Security & Identity", "file": null, "description": "Vaults, envelope encryption, rotation, and short-lived credentials." },
+    { "id": "secrets-management", "title": "Secrets Management", "category": "Security & Identity", "file": "secrets-management.json", "description": "Vaults, envelope encryption, rotation, and short-lived credentials." },
     { "id": "authorization", "title": "Fine-Grained Authorization", "category": "Security & Identity", "file": null, "description": "Relationship-based access control (Zanzibar-style) policy checks." },
 
     { "id": "crm-pipeline", "title": "CRM Data Pipeline", "category": "Data & Analytics", "file": "crm-pipeline.json", "description": "Product events and CRM changes unified into a customer profile and synced back to sales." },
@@ -38,25 +38,25 @@
     { "id": "news-feed", "title": "Social News Feed", "category": "Social & Media", "file": "news-feed.json", "description": "Fan-out on write vs read, ranking, and timeline caching." },
     { "id": "notifications", "title": "Notification System", "category": "Social & Media", "file": "notifications.json", "description": "Push, email, and SMS routing with preferences, batching, and retries." },
     { "id": "video-streaming", "title": "Video Streaming (VOD)", "category": "Social & Media", "file": "video-streaming.json", "description": "Transcoding ladders, adaptive bitrate, DRM, and CDN delivery." },
-    { "id": "live-streaming", "title": "Live Streaming", "category": "Social & Media", "file": null, "description": "Ingest, real-time transcoding, low-latency delivery, and live chat." },
+    { "id": "live-streaming", "title": "Live Streaming", "category": "Social & Media", "file": "live-streaming.json", "description": "Ingest, real-time transcoding, low-latency delivery, and live chat." },
     { "id": "collaborative-editing", "title": "Collaborative Editing", "category": "Social & Media", "file": "collaborative-editing.json", "description": "CRDTs / operational transforms, presence, and conflict-free sync." },
     { "id": "email-delivery", "title": "Email Delivery", "category": "Social & Media", "file": null, "description": "SMTP, SPF/DKIM/DMARC, sender reputation, and bounce handling." },
 
     { "id": "cdn", "title": "Content Delivery Network", "category": "Infrastructure", "file": "cdn.json", "description": "Edge caching, origin shielding, cache keys, and invalidation." },
-    { "id": "dns-resolution", "title": "DNS Resolution", "category": "Infrastructure", "file": null, "description": "Recursive resolvers, authoritative servers, TTLs, and anycast." },
+    { "id": "dns-resolution", "title": "DNS Resolution", "category": "Infrastructure", "file": "dns-resolution.json", "description": "Recursive resolvers, authoritative servers, TTLs, and anycast." },
     { "id": "load-balancer", "title": "Load Balancing", "category": "Infrastructure", "file": "load-balancer.json", "description": "L4 vs L7, health checks, connection draining, and consistent hashing." },
-    { "id": "kubernetes-deploy", "title": "Kubernetes Deployment", "category": "Infrastructure", "file": null, "description": "API server, scheduler, kubelet, controllers, and rolling updates." },
-    { "id": "ci-cd", "title": "CI/CD Pipeline", "category": "Infrastructure", "file": null, "description": "Builds, test sharding, artifact registries, and progressive delivery." },
+    { "id": "kubernetes-deploy", "title": "Kubernetes Deployment", "category": "Infrastructure", "file": "kubernetes-deploy.json", "description": "API server, scheduler, kubelet, controllers, and rolling updates." },
+    { "id": "ci-cd", "title": "CI/CD Pipeline", "category": "Infrastructure", "file": "ci-cd.json", "description": "Builds, test sharding, artifact registries, and progressive delivery." },
     { "id": "distributed-cache", "title": "Distributed Cache", "category": "Infrastructure", "file": "distributed-cache.json", "description": "Cache-aside, sharding, eviction, and thundering-herd protection." },
     { "id": "message-queue", "title": "Message Queue", "category": "Infrastructure", "file": "message-queue.json", "description": "Delivery guarantees, consumer groups, retries, and dead-letter queues." },
-    { "id": "observability", "title": "Observability Stack", "category": "Infrastructure", "file": null, "description": "Logs, metrics, and traces from collection to alerting." },
+    { "id": "observability", "title": "Observability Stack", "category": "Infrastructure", "file": "observability.json", "description": "Logs, metrics, and traces from collection to alerting." },
     { "id": "object-storage", "title": "Object Storage", "category": "Infrastructure", "file": null, "description": "Metadata service, erasure coding, replication, and multipart upload." },
     { "id": "job-scheduler", "title": "Distributed Job Scheduler", "category": "Infrastructure", "file": null, "description": "Cron at scale: leases, exactly-once triggering, and retries." },
     { "id": "feature-flags", "title": "Feature Flags", "category": "Infrastructure", "file": "feature-flags.json", "description": "Flag evaluation, targeting rules, streaming updates, and kill switches." },
     { "id": "url-shortener", "title": "URL Shortener", "category": "Infrastructure", "file": "url-shortener.json", "description": "ID generation, redirects at scale, and click analytics." },
 
     { "id": "maps-navigation", "title": "Maps & Navigation", "category": "Location & IoT", "file": null, "description": "Tile serving, routing graphs, live traffic, and ETA calculation." },
-    { "id": "iot-telemetry", "title": "IoT Telemetry Platform", "category": "Location & IoT", "file": null, "description": "Device provisioning, MQTT ingest, time-series storage, and OTA updates." },
+    { "id": "iot-telemetry", "title": "IoT Telemetry Platform", "category": "Location & IoT", "file": "iot-telemetry.json", "description": "Device provisioning, MQTT ingest, time-series storage, and OTA updates." },
     { "id": "proximity-search", "title": "Nearby Search", "category": "Location & IoT", "file": null, "description": "Geohashes, quadtrees, and finding points of interest near a user." }
   ]
 }

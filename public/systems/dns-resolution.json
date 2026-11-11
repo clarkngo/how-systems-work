@@ -1,0 +1,220 @@
+{
+  "schemaVersion": 1,
+  "id": "dns-resolution",
+  "title": "DNS Resolution",
+  "summary": "DNS turns names like www.example.com into IP addresses using a global, delegated hierarchy. Your device asks a recursive resolver, which walks down from the root servers to the .com servers to the domain's own authoritative servers, following referrals. Every answer carries a TTL, and heavy caching at each layer is what lets a system answering trillions of queries a day respond in milliseconds.",
+  "flows": {
+    "query": { "label": "Client query", "color": "#38bdf8" },
+    "iteration": { "label": "Iterative resolution", "color": "#fbbf24" },
+    "management": { "label": "Zone management", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Ask the resolver", "text": "The browser's OS stub resolver asks the configured recursive resolver (ISP, 1.1.1.1, or 8.8.8.8) for the A record of www.example.com. If a fresh copy is cached, it answers immediately." },
+    { "step": 2, "title": "Ask a root server", "text": "On a cache miss, the resolver asks one of the 13 root server identities, each served from hundreds of anycast sites. The root does not know the answer but refers it to the .com name servers." },
+    { "step": 3, "title": "Ask the TLD server", "text": "The .com servers refer it to example.com's authoritative name servers (ns1.example-dns.net), including their IP addresses as 'glue' when needed." },
+    { "step": 4, "title": "Ask the authoritative server", "text": "The authoritative server returns the answer, www → 93.184.216.34 with TTL 300. With DNSSEC, the resolver also checks the chain of signatures from the root down." },
+    { "step": 5, "title": "Cache and answer", "text": "The resolver caches every answer and referral for its TTL, so the next million users skip most of these steps, then returns the IP to the client." },
+    { "step": 6, "title": "Change a record", "text": "The domain owner updates the record through their DNS provider. The change is live on the authoritative servers in seconds, but resolvers keep serving the old value until their cached TTL runs out. That waiting period is what people call 'propagation'." }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Device (Stub Resolver)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["OS resolver", "DoH / DoT"],
+        "io": {
+          "input": [{ "name": "Answer", "type": "93.184.216.34 (TTL 300)" }],
+          "output": [{ "name": "Query", "type": "A? www.example.com (recursion desired)" }]
+        },
+        "responsibilities": [
+          "Sends every lookup to one configured recursive resolver.",
+          "Keeps a small local cache honouring TTLs.",
+          "Can encrypt queries with DNS-over-HTTPS or DNS-over-TLS."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Resolver unreachable",
+            "impact": "'The internet is down' even though the network works.",
+            "mitigation": "Configure two resolvers on different networks."
+          },
+          {
+            "scenario": "Plaintext DNS on public Wi-Fi",
+            "impact": "Queries observed or spoofed.",
+            "mitigation": "DoH/DoT to a trusted resolver; DNSSEC validation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "resolver",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Recursive Resolver",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Unbound / BIND / 1.1.1.1", "Large shared cache"],
+        "io": {
+          "input": [{ "name": "Query", "type": "From millions of clients" }],
+          "output": [{ "name": "Iterative queries", "type": "To root → TLD → authoritative on a miss" }]
+        },
+        "responsibilities": [
+          "Does the work of walking the hierarchy for its clients.",
+          "Caches answers and referrals until their TTLs expire.",
+          "Validates DNSSEC signatures and randomises query IDs and ports."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cache poisoning",
+            "impact": "Users sent to an attacker's IP.",
+            "mitigation": "Random source ports and IDs, DNSSEC validation, 0x20 case randomisation."
+          },
+          {
+            "scenario": "Authoritative server for a popular domain down",
+            "impact": "Lookups fail once cached entries expire.",
+            "mitigation": "Serve-stale: return expired answers briefly while retrying."
+          }
+        ]
+      }
+    },
+    {
+      "id": "root",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Root Servers",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["13 identities (a–m)", "1,000+ anycast sites"],
+        "io": {
+          "input": [{ "name": "Query", "type": "www.example.com?" }],
+          "output": [{ "name": "Referral", "type": "NS for .com (a.gtld-servers.net …), TTL 2 days" }]
+        },
+        "responsibilities": [
+          "Knows which servers are authoritative for each top-level domain.",
+          "Signs the root zone, the DNSSEC trust anchor.",
+          "Is rarely queried because referrals are cached for days."
+        ],
+        "failureModes": [
+          {
+            "scenario": "DDoS on root servers",
+            "impact": "In theory, resolution of new TLD lookups fails.",
+            "mitigation": "Massive anycast spread; long-cached TLD referrals make users barely notice."
+          },
+          {
+            "scenario": "Root key rollover issues",
+            "impact": "Validating resolvers with stale trust anchors fail.",
+            "mitigation": "Automated trust-anchor updates (RFC 5011) and long transition periods."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tld",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "TLD Servers (.com)",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Registry operator (Verisign)", "Anycast"],
+        "io": {
+          "input": [{ "name": "Query", "type": "www.example.com?" }],
+          "output": [{ "name": "Referral", "type": "NS ns1.example-dns.net + glue IPs, DS record" }]
+        },
+        "responsibilities": [
+          "Delegates each registered domain to its name servers.",
+          "Publishes DS records that link the domain into the DNSSEC chain.",
+          "Updates when owners change name servers at their registrar."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Wrong NS set at the registrar",
+            "impact": "Entire domain unresolvable for its TTL (often 2 days).",
+            "mitigation": "Double-check NS changes; keep old servers answering during migration."
+          },
+          {
+            "scenario": "Stale DS record after changing DNS provider",
+            "impact": "DNSSEC validation fails and the domain disappears for validating users.",
+            "mitigation": "Follow the DNSSEC key rollover steps when moving providers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "authoritative",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Authoritative Servers",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Route 53 / Cloudflare / NS1", "Anycast, multiple providers"],
+        "io": {
+          "input": [{ "name": "Query", "type": "A? www.example.com" }],
+          "output": [{ "name": "Answer", "type": "93.184.216.34, TTL 300 (+ RRSIG)" }]
+        },
+        "responsibilities": [
+          "Holds the source of truth for the domain's records.",
+          "Can answer differently by location or health (GeoDNS, failover).",
+          "Signs records for DNSSEC."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Single DNS provider outage (Dyn, 2016)",
+            "impact": "Major sites unreachable once caches expire.",
+            "mitigation": "Two independent providers serving the same zone."
+          },
+          {
+            "scenario": "TTL too long before a migration",
+            "impact": "The cutover takes days to reach everyone.",
+            "mitigation": "Lower TTLs a day or two ahead of planned changes."
+          }
+        ]
+      }
+    },
+    {
+      "id": "zone",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Zone Management",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Provider API / Terraform", "OctoDNS"],
+        "io": {
+          "input": [{ "name": "Change", "type": "UPSERT www A 93.184.216.35 TTL 60" }],
+          "output": [{ "name": "Zone update", "type": "Pushed to all authoritative PoPs in seconds" }]
+        },
+        "responsibilities": [
+          "Manages records as code with review.",
+          "Pushes changes to every authoritative location.",
+          "Keeps multiple providers' zones in sync."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Accidental record deletion",
+            "impact": "Service unreachable as caches expire.",
+            "mitigation": "Changes via reviewed code, plans that show deletions, and zone backups."
+          },
+          {
+            "scenario": "Dangling CNAME to a deprovisioned resource",
+            "impact": "Subdomain takeover by an attacker.",
+            "mitigation": "Remove records when resources are deleted; scan for dangling entries."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-resolver", "source": "client", "sourceHandle": "r", "target": "resolver", "targetHandle": "l", "data": { "flow": "query", "payload": "A? ⇄ IP (cached)", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-resolver-root", "source": "resolver", "sourceHandle": "t", "target": "root", "targetHandle": "l", "data": { "flow": "iteration", "payload": "→ referral to .com", "steps": [2], "bidirectional": true } },
+    { "id": "e-resolver-tld", "source": "resolver", "sourceHandle": "b", "target": "tld", "targetHandle": "l", "data": { "flow": "iteration", "payload": "→ referral to ns1", "steps": [3], "bidirectional": true } },
+    { "id": "e-resolver-authoritative", "source": "resolver", "sourceHandle": "r", "target": "authoritative", "targetHandle": "l", "data": { "flow": "iteration", "payload": "→ answer + TTL", "steps": [4, 5], "bidirectional": true } },
+    { "id": "e-zone-authoritative", "source": "zone", "sourceHandle": "l", "target": "authoritative", "targetHandle": "r", "data": { "flow": "management", "payload": "record changes", "steps": [6] } }
+  ]
+}

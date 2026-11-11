@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "observability",
+  "title": "Observability Stack",
+  "summary": "Observability means being able to ask why production is misbehaving without shipping new code. Services emit three kinds of signal: metrics (cheap numbers over time), logs (detailed events), and traces (one request's path across services), all tagged with the same trace ID. Collectors process and route each signal to a store suited to it. Alerts on metrics wake someone up, and they pivot from a spike to the traces and logs that explain it.",
+  "flows": {
+    "telemetry": { "label": "Telemetry pipeline", "color": "#38bdf8" },
+    "alerting": { "label": "Alerting", "color": "#f472b6" },
+    "investigation": { "label": "Investigation", "color": "#fbbf24", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Instrument and emit", "text": "Each service's OpenTelemetry SDK records request metrics, structured logs, and trace spans, and stamps the current trace_id on all three. A collector agent on each node receives them, batches, adds Kubernetes labels, and drops noisy data." },
+    { "step": 2, "title": "Metrics to a time-series DB", "text": "Counters and histograms (requests, errors, latency buckets) are written as time series. Each unique label combination is a separate series, so labels must stay low-cardinality." },
+    { "step": 3, "title": "Logs to a log store", "text": "Structured JSON logs are indexed by a few labels and compressed. Full-text search runs over a time range rather than over everything." },
+    { "step": 4, "title": "Traces, tail-sampled", "text": "The collector waits for a trace to finish, then keeps all errors and slow traces plus a small sample of normal ones, which cuts storage by about 90% without losing the interesting ones." },
+    { "step": 5, "title": "Evaluate alert rules", "text": "Alert rules run every 30 seconds against metrics, for example 'checkout error budget burning 14× faster than allowed over 1 h and 5 m'. Rules based on SLOs catch real user pain, not every blip." },
+    { "step": 6, "title": "Page the on-call", "text": "The firing alert is deduplicated and grouped, routed to the owning team's rotation, and links to a runbook and dashboard." },
+    { "step": 7, "title": "Pivot to the cause", "text": "On the latency graph, an exemplar dot links to a slow trace. The trace shows the payment call took 4 s, and its trace_id pulls up that request's logs, which contain the error." }
+  ],
+  "nodes": [
+    {
+      "id": "services",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Instrumented Services",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["OpenTelemetry SDK", "Auto-instrumentation"],
+        "io": {
+          "input": [{ "name": "Context", "type": "traceparent header propagated between services" }],
+          "output": [{ "name": "Signals", "type": "Metrics, JSON logs, spans: all with trace_id" }]
+        },
+        "responsibilities": [
+          "Emit the key signals: request rate, errors, duration, saturation.",
+          "Propagate trace context across HTTP, gRPC, and message queues.",
+          "Log structured events, not free text."
+        ],
+        "failureModes": [
+          {
+            "scenario": "User ID used as a metric label",
+            "impact": "Millions of series; the metrics DB runs out of memory.",
+            "mitigation": "Cardinality limits in the SDK and collector; IDs belong in logs and traces."
+          },
+          {
+            "scenario": "Context not propagated through a queue",
+            "impact": "Traces break into disconnected fragments.",
+            "mitigation": "Inject trace context into message headers; test with end-to-end traces."
+          }
+        ]
+      }
+    },
+    {
+      "id": "collector",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "OTel Collectors",
+        "layer": "gateway",
+        "criticality": "degradable",
+        "tech": ["Agent per node + gateway tier", "Tail sampling"],
+        "io": {
+          "input": [{ "name": "OTLP", "type": "Batches of metrics, logs, spans" }],
+          "output": [{ "name": "Routed", "type": "Each signal to its backend, enriched and filtered" }]
+        },
+        "responsibilities": [
+          "Buffers and batches so services never block on telemetry.",
+          "Adds metadata (pod, node, region) and removes secrets and PII.",
+          "Samples traces after they complete and drops debug logs in production."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Backend outage fills collector buffers",
+            "impact": "Telemetry dropped exactly during the incident.",
+            "mitigation": "Disk-backed queues; prioritise errors and metrics over debug data."
+          },
+          {
+            "scenario": "Collector itself overloaded",
+            "impact": "Back pressure slows the services.",
+            "mitigation": "Non-blocking SDK exporters that drop rather than block; scale collectors on queue depth."
+          }
+        ]
+      }
+    },
+    {
+      "id": "metrics",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Metrics TSDB",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Prometheus / Mimir", "Object-storage long term"],
+        "io": {
+          "input": [{ "name": "Samples", "type": "http_requests_total{svc,route,code} @ t" }],
+          "output": [{ "name": "Queries", "type": "PromQL: rate(), histogram_quantile()" }]
+        },
+        "responsibilities": [
+          "Stores numeric time series cheaply with high compression.",
+          "Answers aggregate queries over days in milliseconds.",
+          "Serves as the source for alerts and SLO tracking."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cardinality explosion after a deploy",
+            "impact": "Ingest rejected or OOM; dashboards go blank.",
+            "mitigation": "Per-tenant series limits and alerting on series growth."
+          },
+          {
+            "scenario": "Averages hide the tail",
+            "impact": "p99 pain invisible behind a fine mean.",
+            "mitigation": "Histograms and percentile SLOs, not averages."
+          }
+        ]
+      }
+    },
+    {
+      "id": "logs",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Log Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Loki / Elasticsearch", "Tiered retention"],
+        "io": {
+          "input": [{ "name": "Log lines", "type": "{ ts, level, svc, trace_id, msg, … }" }],
+          "output": [{ "name": "Search", "type": "Filter by labels + text over a time range" }]
+        },
+        "responsibilities": [
+          "Keeps detailed events for debugging and audit.",
+          "Indexes cheaply (labels) and scans contents when needed.",
+          "Finds every log line for one trace_id."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Log volume (and bill) explodes",
+            "impact": "Budget blown; ingestion throttled.",
+            "mitigation": "Sampling for verbose logs, retention tiers, and per-team quotas."
+          },
+          {
+            "scenario": "Secrets or PII written to logs",
+            "impact": "Security and privacy exposure.",
+            "mitigation": "Redaction in the collector; structured logging with safe fields."
+          }
+        ]
+      }
+    },
+    {
+      "id": "alerting",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Alerting & Paging",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Alertmanager", "PagerDuty / Opsgenie"],
+        "io": {
+          "input": [{ "name": "Rules", "type": "SLO burn-rate expressions evaluated every 30 s" }],
+          "output": [{ "name": "Page", "type": "Grouped alert → on-call + runbook link" }]
+        },
+        "responsibilities": [
+          "Evaluates alert rules and deduplicates firing alerts.",
+          "Routes to the owning team's rotation with escalation.",
+          "Supports silences during maintenance."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Alert fatigue",
+            "impact": "Too many noisy pages, so real ones are ignored.",
+            "mitigation": "Alert on symptoms (SLO burn), not causes; review every page."
+          },
+          {
+            "scenario": "Monitoring dies with the system",
+            "impact": "No alert during the outage.",
+            "mitigation": "A dead man's switch heartbeat to an external service; run monitoring separately."
+          }
+        ]
+      }
+    },
+    {
+      "id": "traces",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Trace Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Tempo / Jaeger", "Exemplars"],
+        "io": {
+          "input": [{ "name": "Spans", "type": "Sampled traces (errors + slow + baseline)" }],
+          "output": [{ "name": "Trace view", "type": "Waterfall of spans by trace_id" }]
+        },
+        "responsibilities": [
+          "Stores request paths across dozens of services.",
+          "Shows where time went and which hop failed.",
+          "Links metrics exemplars to concrete example traces."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Head sampling drops the interesting traces",
+            "impact": "The one slow request was not kept.",
+            "mitigation": "Tail sampling that keeps all errors and high-latency traces."
+          },
+          {
+            "scenario": "Clock skew between hosts",
+            "impact": "Spans appear out of order.",
+            "mitigation": "NTP discipline; trust parent-child structure over raw timestamps."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dashboards",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Dashboards & Exploration",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Grafana", "Correlated views"],
+        "io": {
+          "input": [{ "name": "Queries", "type": "Metrics, logs, and traces for one service and time" }],
+          "output": [{ "name": "Answers", "type": "Graph → exemplar trace → matching logs" }]
+        },
+        "responsibilities": [
+          "Shows service health against SLOs at a glance.",
+          "Lets engineers pivot between signals with one click.",
+          "Hosts runbooks linked from alerts."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hundreds of unmaintained dashboards",
+            "impact": "Nobody finds the right one mid-incident.",
+            "mitigation": "Standard per-service dashboards generated from templates."
+          },
+          {
+            "scenario": "Expensive queries during an incident",
+            "impact": "The whole stack slows when it is needed most.",
+            "mitigation": "Query limits, recording rules, and pre-aggregated views."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-services-collector", "source": "services", "sourceHandle": "r", "target": "collector", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "OTLP: metrics, logs, spans", "steps": [1] } },
+    { "id": "e-collector-metrics", "source": "collector", "sourceHandle": "t", "target": "metrics", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "remote write", "steps": [2] } },
+    { "id": "e-collector-logs", "source": "collector", "sourceHandle": "b", "target": "logs", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "structured logs", "steps": [3] } },
+    { "id": "e-collector-traces", "source": "collector", "sourceHandle": "r", "target": "traces", "targetHandle": "t", "data": { "flow": "telemetry", "payload": "tail-sampled spans", "steps": [4] } },
+    { "id": "e-metrics-alerting", "source": "metrics", "sourceHandle": "r", "target": "alerting", "targetHandle": "l", "data": { "flow": "alerting", "payload": "SLO burn rules", "steps": [5] } },
+    { "id": "e-alerting-dashboards", "source": "alerting", "sourceHandle": "r", "target": "dashboards", "targetHandle": "t", "data": { "flow": "alerting", "payload": "page + runbook", "steps": [6] } },
+    { "id": "e-traces-dashboards", "source": "traces", "sourceHandle": "r", "target": "dashboards", "targetHandle": "b", "data": { "flow": "investigation", "payload": "exemplar → trace → logs", "steps": [7], "bidirectional": true } }
+  ]
+}

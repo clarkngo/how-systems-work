@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "id": "stock-exchange",
+  "title": "Stock Exchange Matching Engine",
+  "summary": "An exchange matches buy and sell orders fairly and very fast, millions per second with microsecond latency. The trick is determinism. Every order passes risk checks, then a sequencer gives it one global position in a journal, and a single-threaded matching engine replays that journal in order. Any replica fed the same journal reaches exactly the same order book, which makes failover and audits possible.",
+  "flows": {
+    "orders": { "label": "Order flow", "color": "#38bdf8" },
+    "marketdata": { "label": "Market data", "color": "#fbbf24" },
+    "post": { "label": "Post-trade", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Submit an order", "text": "A broker sends a FIX NewOrderSingle: buy 500 ACME limit $101.20. It arrives at an order gateway in the exchange's co-location data centre." },
+    { "step": 2, "title": "Pre-trade risk checks", "text": "The gateway checks the member's credit limit, price bands (no buying at 10× the last price), maximum order size, and kill-switch status in a few microseconds." },
+    { "step": 3, "title": "Sequence and journal", "text": "The sequencer gives the order the next global sequence number and writes it to a replicated journal. This one ordering is the official history of the market." },
+    { "step": 4, "title": "Match by price-time priority", "text": "The single-threaded matching engine applies the order to the ACME book. It fills against the best-priced resting sells, and earlier orders at the same price go first. The rest rests on the book." },
+    { "step": 5, "title": "Execution reports", "text": "Both sides get execution reports (filled 300 @ 101.18, 200 resting) back through the sequencer and gateway." },
+    { "step": 6, "title": "Publish market data", "text": "Every trade and book change goes out on a multicast feed to all subscribers at the same moment, so nobody sees prices earlier than anyone else." },
+    { "step": 7, "title": "Clear and settle", "text": "Trades go to the clearing house, which becomes the counterparty to both sides (novation), nets positions, and settles cash and shares on T+1." }
+  ],
+  "nodes": [
+    {
+      "id": "traders",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Brokers & Traders",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["FIX / binary protocols", "Co-located servers"],
+        "io": {
+          "input": [{ "name": "Feeds", "type": "Execution reports + market data" }],
+          "output": [{ "name": "Orders", "type": "New / cancel / replace (limit, market, IOC)" }]
+        },
+        "responsibilities": [
+          "Send orders on behalf of clients and their own trading.",
+          "Track their open orders from execution reports.",
+          "Run their own risk controls before orders leave the firm."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Runaway algorithm",
+            "impact": "Thousands of erroneous orders in seconds (Knight Capital lost $440M in 45 minutes).",
+            "mitigation": "Exchange-side kill switches and per-member order-rate and position limits."
+          },
+          {
+            "scenario": "Disconnect with orders resting",
+            "impact": "Stale quotes get picked off.",
+            "mitigation": "Cancel-on-disconnect for that session."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Order Gateway & Risk",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["FIX engine", "FPGA risk checks"],
+        "io": {
+          "input": [{ "name": "Order", "type": "FIX 35=D, Symbol=ACME, Side=1, Qty=500, Px=101.20" }],
+          "output": [{ "name": "Checked order", "type": "Internal binary message or reject" }]
+        },
+        "responsibilities": [
+          "Authenticates member sessions and normalises protocols.",
+          "Runs pre-trade risk checks without adding much latency.",
+          "Returns execution reports to the right session."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Gateway slower for some members",
+            "impact": "Unfair access; regulatory complaints.",
+            "mitigation": "Equal cable lengths and identical hardware for every member."
+          },
+          {
+            "scenario": "Risk limits out of date",
+            "impact": "A member trades beyond its collateral.",
+            "mitigation": "Limits updated intraday from clearing; reject by default when unknown."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sequencer",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "Sequencer & Journal",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Total-order broadcast", "Replicated journal"],
+        "io": {
+          "input": [{ "name": "Orders", "type": "From all gateways, concurrently" }],
+          "output": [{ "name": "Stream", "type": "seq 88412093: NEW ACME B 500 @ 101.20" }]
+        },
+        "responsibilities": [
+          "Puts every event into one global order.",
+          "Persists and replicates the journal before matching acts on it.",
+          "Lets any replica rebuild the exact market state by replay."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Primary sequencer fails",
+            "impact": "Trading halts until a new one takes over.",
+            "mitigation": "Hot standby consuming the same journal; deterministic takeover in milliseconds."
+          },
+          {
+            "scenario": "Journal gap or duplicate",
+            "impact": "Replicas diverge from the primary.",
+            "mitigation": "Gap detection with retransmission; checksums on book state."
+          }
+        ]
+      }
+    },
+    {
+      "id": "matching",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Matching Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Single-threaded, in-memory", "Per-symbol order books"],
+        "io": {
+          "input": [{ "name": "Sequenced events", "type": "New / cancel / replace in sequence order" }],
+          "output": [{ "name": "Results", "type": "Trades, book updates, execution reports" }]
+        },
+        "responsibilities": [
+          "Matches by price, then time: best price first, earliest first at the same price.",
+          "Is deterministic: the same input sequence always gives the same output.",
+          "Runs auctions at open and close and enforces halts and circuit breakers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Garbage collection or OS jitter",
+            "impact": "Latency spikes; unfair, unpredictable fills.",
+            "mitigation": "No allocation on the hot path, pinned CPU cores, kernel bypass networking."
+          },
+          {
+            "scenario": "Extreme price move",
+            "impact": "Erroneous trades far from fair value.",
+            "mitigation": "Limit-up/limit-down bands, volatility halts, and erroneous-trade rules."
+          }
+        ]
+      }
+    },
+    {
+      "id": "marketdata",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Market Data Feed",
+        "layer": "gateway",
+        "criticality": "degradable",
+        "tech": ["UDP multicast", "ITCH-style binary"],
+        "io": {
+          "input": [{ "name": "Book events", "type": "Adds, cancels, executions per symbol" }],
+          "output": [{ "name": "Feed", "type": "Multicast packets with sequence numbers" }]
+        },
+        "responsibilities": [
+          "Publishes every order-book change to all subscribers at once.",
+          "Provides snapshot and retransmit services for recovery.",
+          "Supplies the official prices used by indices and regulators."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Subscriber misses packets",
+            "impact": "Its view of the book is wrong.",
+            "mitigation": "Sequence numbers, A/B redundant feeds, and gap retransmission."
+          },
+          {
+            "scenario": "Feed lags matching",
+            "impact": "Traders act on stale prices.",
+            "mitigation": "Capacity headroom for peak bursts; latency monitoring per packet."
+          }
+        ]
+      }
+    },
+    {
+      "id": "clearing",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Clearing & Settlement",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["Central counterparty (CCP)", "Depository (T+1)"],
+        "io": {
+          "input": [{ "name": "Trades", "type": "Matched trades with member IDs" }],
+          "output": [{ "name": "Settlement", "type": "Net obligations; shares and cash move on T+1" }]
+        },
+        "responsibilities": [
+          "Becomes buyer to every seller and seller to every buyer (novation).",
+          "Nets each member's trades into one obligation per security.",
+          "Collects margin so one member's default cannot cascade."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Member defaults",
+            "impact": "Counterparties are exposed to losses.",
+            "mitigation": "Margin, a default fund, and auctioning the defaulter's positions."
+          },
+          {
+            "scenario": "Trade feed to clearing delayed",
+            "impact": "Risk exposure unknown intraday.",
+            "mitigation": "Real-time drop copies and end-of-day reconciliation."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-traders-gateway", "source": "traders", "sourceHandle": "r", "target": "gateway", "targetHandle": "l", "data": { "flow": "orders", "payload": "FIX order ⇄ exec reports", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-gateway-sequencer", "source": "gateway", "sourceHandle": "r", "target": "sequencer", "targetHandle": "l", "data": { "flow": "orders", "payload": "risk-checked", "steps": [2, 5], "bidirectional": true } },
+    { "id": "e-sequencer-matching", "source": "sequencer", "sourceHandle": "r", "target": "matching", "targetHandle": "l", "data": { "flow": "orders", "payload": "sequenced journal", "steps": [3, 5], "bidirectional": true } },
+    { "id": "e-matching-marketdata", "source": "matching", "sourceHandle": "r", "target": "marketdata", "targetHandle": "l", "data": { "flow": "marketdata", "payload": "trades + book updates", "steps": [4, 6] } },
+    { "id": "e-marketdata-traders", "source": "marketdata", "sourceHandle": "t", "target": "traders", "targetHandle": "t", "data": { "flow": "marketdata", "payload": "multicast feed", "steps": [6] } },
+    { "id": "e-matching-clearing", "source": "matching", "sourceHandle": "r", "target": "clearing", "targetHandle": "l", "data": { "flow": "post", "payload": "trades → CCP", "steps": [7] } }
+  ]
+}

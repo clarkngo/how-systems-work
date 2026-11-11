@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "iot-telemetry",
+  "title": "IoT Telemetry Platform",
+  "summary": "An IoT platform connects millions of small, unreliable devices to the cloud. Each device has its own certificate and publishes sensor readings over MQTT, a lightweight protocol built for flaky networks. A rules engine routes the stream to a time-series database and alerting, and firmware updates flow back out in signed, staged rollouts that can roll back when a device fails to boot.",
+  "flows": {
+    "telemetry": { "label": "Telemetry (device → cloud)", "color": "#34d399" },
+    "identity": { "label": "Identity & fleet", "color": "#a78bfa" },
+    "ota": { "label": "Firmware updates (cloud → device)", "color": "#fbbf24" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Device connects and publishes", "text": "A thermostat opens a TLS connection with its X.509 client certificate and publishes readings to devices/th-8812/telemetry every 30 s, buffering locally while offline." },
+    { "step": 2, "title": "Authenticate and authorise", "text": "The broker checks the certificate against the device registry, then applies a topic policy: this device may only publish under its own ID." },
+    { "step": 3, "title": "Route with rules", "text": "A rule such as SELECT temp, humidity FROM 'devices/+/telemetry' forwards messages into a stream, where they are validated, enriched with device metadata, and checked for anomalies." },
+    { "step": 4, "title": "Store as time series", "text": "Readings are written to a time-series database, keeping raw data for days and downsampled 1-minute and 1-hour rollups for years." },
+    { "step": 5, "title": "Visualise and alert", "text": "Dashboards show fleet health. Alerts fire on thresholds (freezer above -10 °C) or on silence (no data for 10 minutes)." },
+    { "step": 6, "title": "Plan a firmware rollout", "text": "Operators target a cohort from the registry, such as hardware rev B on firmware 2.3, and schedule v2.4 for 1% of them first." },
+    { "step": 7, "title": "Deliver the update over the air", "text": "Devices download the signed image, verify it, write it to the inactive partition, and reboot into it. If the new firmware fails its health check, the bootloader switches back automatically." }
+  ],
+  "nodes": [
+    {
+      "id": "devices",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Devices",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["MCU firmware", "MQTT client", "A/B partitions"],
+        "io": {
+          "input": [{ "name": "Downlink", "type": "Commands, config, firmware jobs" }],
+          "output": [{ "name": "Telemetry", "type": "MQTT QoS 1: { temp: 21.4, rh: 40, batt: 88, ts }" }]
+        },
+        "responsibilities": [
+          "Sample sensors and publish efficiently to save battery and bandwidth.",
+          "Buffer readings while offline and resend later.",
+          "Apply updates safely with automatic rollback."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Whole fleet reconnects at once after an outage",
+            "impact": "A reconnect storm overwhelms the broker.",
+            "mitigation": "Exponential backoff with random jitter on every device."
+          },
+          {
+            "scenario": "Device clock wrong",
+            "impact": "Readings land at the wrong time.",
+            "mitigation": "Sync time on connect; record both device and server timestamps."
+          }
+        ]
+      }
+    },
+    {
+      "id": "broker",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "MQTT Broker",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["AWS IoT Core / EMQX", "mTLS"],
+        "io": {
+          "input": [{ "name": "Connections", "type": "Millions of long-lived TLS sessions" }],
+          "output": [{ "name": "Messages", "type": "Authorised publishes routed by topic" }]
+        },
+        "responsibilities": [
+          "Holds persistent connections cheaply with keep-alives.",
+          "Enforces per-device topic permissions.",
+          "Queues messages for devices that are briefly offline (persistent sessions)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Overly broad topic policy",
+            "impact": "One hacked device can impersonate or listen to others.",
+            "mitigation": "Policy variables bound to the device ID in its certificate."
+          },
+          {
+            "scenario": "Broker node failure",
+            "impact": "Its devices disconnect simultaneously.",
+            "mitigation": "Clustered brokers behind a load balancer; devices reconnect with jitter."
+          }
+        ]
+      }
+    },
+    {
+      "id": "registry",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Device Registry",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Certificate authority", "Device shadow"],
+        "io": {
+          "input": [{ "name": "Provisioning", "type": "Factory-issued cert, claimed by an owner" }],
+          "output": [{ "name": "Identity", "type": "{ deviceId, model, hwRev, fw, owner, desired/reported state }" }]
+        },
+        "responsibilities": [
+          "Knows every device, its certificate, owner, and firmware version.",
+          "Keeps a 'shadow' of each device's desired and reported state.",
+          "Revokes certificates for lost or compromised devices."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Shared credentials baked into all devices",
+            "impact": "One extracted key compromises the whole fleet.",
+            "mitigation": "Unique per-device keys in a secure element, generated at manufacture."
+          },
+          {
+            "scenario": "Certificates expire in the field",
+            "impact": "Devices can no longer connect.",
+            "mitigation": "Long-lived device certs with an over-the-air rotation path."
+          }
+        ]
+      }
+    },
+    {
+      "id": "rules",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Rules & Stream Processing",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["SQL topic rules", "Kinesis / Kafka + Flink"],
+        "io": {
+          "input": [{ "name": "Messages", "type": "devices/+/telemetry" }],
+          "output": [{ "name": "Clean stream", "type": "Validated, enriched readings + anomaly flags" }]
+        },
+        "responsibilities": [
+          "Routes topics to the right downstream systems.",
+          "Validates units and ranges and drops corrupt readings.",
+          "Detects anomalies and silence in real time."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Malformed payloads from a firmware bug",
+            "impact": "Pipeline errors or poisoned data.",
+            "mitigation": "Schema validation with a dead-letter stream per firmware version."
+          },
+          {
+            "scenario": "Burst after mass reconnect",
+            "impact": "Backlog delays alerts.",
+            "mitigation": "Buffer in the stream; process recent data first."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tsdb",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Time-Series Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["TimescaleDB / InfluxDB", "Downsampling"],
+        "io": {
+          "input": [{ "name": "Points", "type": "(deviceId, metric, ts, value)" }],
+          "output": [{ "name": "Queries", "type": "avg(temp) by site, 5-minute buckets, last 7 days" }]
+        },
+        "responsibilities": [
+          "Ingests millions of points per second, written mostly in time order.",
+          "Keeps rollups so long-range queries stay fast and cheap.",
+          "Applies retention: raw for days, aggregates for years."
+        ],
+        "failureModes": [
+          {
+            "scenario": "High-cardinality tags",
+            "impact": "Index blowup and slow queries.",
+            "mitigation": "Device ID as a series key, not free-form tags; limit tag sets."
+          },
+          {
+            "scenario": "Late or out-of-order data",
+            "impact": "Rollups computed before all data arrived.",
+            "mitigation": "Recompute recent buckets as late data lands."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ota",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "OTA Update Service",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Signed images", "Staged jobs"],
+        "io": {
+          "input": [{ "name": "Rollout", "type": "fw 2.4 → cohort hwRev=B, 1% → 10% → 100%" }],
+          "output": [{ "name": "Job", "type": "Download URL + signature + success criteria" }]
+        },
+        "responsibilities": [
+          "Delivers firmware in stages with automatic halt on failures.",
+          "Signs images so devices accept only genuine firmware.",
+          "Tracks per-device update status."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bad firmware bricks devices",
+            "impact": "Truck rolls or product recalls.",
+            "mitigation": "A/B partitions with boot health checks and automatic fallback; tiny first cohort."
+          },
+          {
+            "scenario": "Whole fleet downloads at once",
+            "impact": "CDN and cellular data cost spikes.",
+            "mitigation": "Staggered schedules and delta updates."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dashboards",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Dashboards & Alerts",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Grafana", "Alert routing"],
+        "io": {
+          "input": [{ "name": "Data", "type": "Time-series queries + anomaly events" }],
+          "output": [{ "name": "Actions", "type": "Notifications, tickets, maintenance dispatch" }]
+        },
+        "responsibilities": [
+          "Shows fleet health: online count, battery, firmware mix.",
+          "Alerts on thresholds and on devices going silent.",
+          "Gives customers views of their own devices."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Alerting on every device individually",
+            "impact": "Thousands of pages during a regional network outage.",
+            "mitigation": "Aggregate alerts by site or region; alert on fleet-wide rates."
+          },
+          {
+            "scenario": "Silence mistaken for normality",
+            "impact": "Dead devices go unnoticed.",
+            "mitigation": "'No data' alerts per device class."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-devices-broker", "source": "devices", "sourceHandle": "r", "target": "broker", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "MQTT over mTLS", "steps": [1], "bidirectional": true } },
+    { "id": "e-broker-registry", "source": "broker", "sourceHandle": "t", "target": "registry", "targetHandle": "l", "data": { "flow": "identity", "payload": "cert + topic policy", "steps": [2], "bidirectional": true } },
+    { "id": "e-broker-rules", "source": "broker", "sourceHandle": "b", "target": "rules", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "topic rules", "steps": [3] } },
+    { "id": "e-rules-tsdb", "source": "rules", "sourceHandle": "r", "target": "tsdb", "targetHandle": "l", "data": { "flow": "telemetry", "payload": "validated readings", "steps": [4] } },
+    { "id": "e-tsdb-dashboards", "source": "tsdb", "sourceHandle": "r", "target": "dashboards", "targetHandle": "b", "data": { "flow": "telemetry", "payload": "queries + alerts", "steps": [5] } },
+    { "id": "e-registry-ota", "source": "registry", "sourceHandle": "r", "target": "ota", "targetHandle": "l", "data": { "flow": "identity", "payload": "target cohort", "steps": [6] } },
+    { "id": "e-ota-devices", "source": "ota", "sourceHandle": "t", "target": "devices", "targetHandle": "t", "data": { "flow": "ota", "payload": "signed firmware (staged)", "steps": [7] } }
+  ]
+}
