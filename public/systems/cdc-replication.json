@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "id": "cdc-replication",
+  "title": "Database Change Data Capture",
+  "summary": "Change data capture streams every committed change in a database to other systems without the application having to publish anything. A connector reads the database's own write-ahead log, the same log used for replication, and turns each insert, update, and delete into an ordered event. Search indexes, caches, and warehouses then stay in sync within seconds, and they can never miss a write the database actually committed.",
+  "flows": {
+    "commit": { "label": "Commit path", "color": "#38bdf8" },
+    "capture": { "label": "Log capture", "color": "#a78bfa" },
+    "deliver": { "label": "Delivery to sinks", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Application commits", "text": "The app runs UPDATE orders SET status = 'shipped' WHERE id = 42 and commits. It does nothing else: no dual writes to Kafka or search." },
+    { "step": 2, "title": "Read the write-ahead log", "text": "The connector holds a logical replication slot. Postgres decodes the WAL record into a row change with before and after values, in commit order." },
+    { "step": 3, "title": "Register the schema", "text": "The connector registers the table's schema (Avro or Protobuf) with a schema registry, so consumers can decode events and the schema can evolve safely." },
+    { "step": 4, "title": "Publish keyed events", "text": "The change is published to topic db.public.orders keyed by primary key, so all changes to order 42 land in one partition and stay in order." },
+    { "step": 5, "title": "Sinks apply changes", "text": "Consumers upsert into Elasticsearch, invalidate cache keys, and load the warehouse. They apply events idempotently by key and log position, so redelivery is harmless." },
+    { "step": 6, "title": "Acknowledge the log position", "text": "After Kafka confirms the write, the connector reports the processed log sequence number (LSN) to the database, which can then discard WAL older than that." },
+    { "step": 7, "title": "Snapshot and resume", "text": "A new connector first takes a consistent snapshot of existing rows, then switches seamlessly to streaming the log from the snapshot's position." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Application",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Any service writing to the DB"],
+        "io": {
+          "input": [{ "name": "Result", "type": "COMMIT OK" }],
+          "output": [{ "name": "Writes", "type": "INSERT / UPDATE / DELETE in transactions" }]
+        },
+        "responsibilities": [
+          "Writes only to its database, the single source of truth.",
+          "Needs no knowledge of downstream consumers.",
+          "Uses transactions so related changes commit together."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Dual writes (DB, then Kafka) instead of CDC",
+            "impact": "A crash between the two leaves systems inconsistent.",
+            "mitigation": "CDC or the transactional outbox pattern."
+          },
+          {
+            "scenario": "Bulk backfill UPDATE of 50M rows",
+            "impact": "A flood of change events overwhelms sinks.",
+            "mitigation": "Batch large migrations; throttle; warn downstream teams."
+          }
+        ]
+      }
+    },
+    {
+      "id": "db",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Source Database",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres WAL / MySQL binlog", "Logical replication slot"],
+        "io": {
+          "input": [{ "name": "Transactions", "type": "Committed changes" }],
+          "output": [{ "name": "Change stream", "type": "Decoded row changes in commit order (LSN)" }]
+        },
+        "responsibilities": [
+          "Records every change in its write-ahead log for durability.",
+          "Decodes log records into logical row changes for subscribers.",
+          "Keeps log segments until the slot confirms it has consumed them."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Connector down for hours",
+            "impact": "Unconsumed WAL piles up and fills the database disk.",
+            "mitigation": "Alert on slot lag; max_slot_wal_keep_size as a safety limit."
+          },
+          {
+            "scenario": "Failover to a replica",
+            "impact": "Replication slot may not exist on the new primary.",
+            "mitigation": "Failover-aware slots, or re-snapshot after failover."
+          }
+        ]
+      }
+    },
+    {
+      "id": "connector",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "CDC Connector",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Debezium on Kafka Connect", "Offset tracking"],
+        "io": {
+          "input": [{ "name": "Log", "type": "Row changes + LSN" }],
+          "output": [{ "name": "Events", "type": "{ before, after, op: 'u', source: { lsn, ts } }" }]
+        },
+        "responsibilities": [
+          "Turns log records into structured change events.",
+          "Snapshots existing data, then streams changes with no gap.",
+          "Records its position so restarts resume exactly."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Restart replays events",
+            "impact": "Duplicates downstream (at-least-once delivery).",
+            "mitigation": "Sinks apply idempotently using key and LSN."
+          },
+          {
+            "scenario": "Column type change breaks decoding",
+            "impact": "Connector stops; lag grows.",
+            "mitigation": "Compatible migrations; schema registry compatibility rules."
+          }
+        ]
+      }
+    },
+    {
+      "id": "registry",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Schema Registry",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Confluent / Apicurio", "Compatibility rules"],
+        "io": {
+          "input": [{ "name": "Register", "type": "orders-value schema v7" }],
+          "output": [{ "name": "Lookup", "type": "Schema by ID for decoding" }]
+        },
+        "responsibilities": [
+          "Versions each table's event schema.",
+          "Rejects incompatible changes that would break consumers.",
+          "Lets each event carry a small schema ID instead of the full schema."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Breaking change registered with compatibility off",
+            "impact": "Consumers fail to decode new events.",
+            "mitigation": "Enforce BACKWARD or FULL compatibility per subject."
+          },
+          {
+            "scenario": "Registry unavailable",
+            "impact": "New schema versions cannot be used.",
+            "mitigation": "Clients cache schemas; run the registry highly available."
+          }
+        ]
+      }
+    },
+    {
+      "id": "topics",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Change Topics",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Kafka", "Keyed by primary key", "Log compaction"],
+        "io": {
+          "input": [{ "name": "Events", "type": "db.public.orders, key = order id" }],
+          "output": [{ "name": "Ordered stream", "type": "Per-key ordered changes to all consumers" }]
+        },
+        "responsibilities": [
+          "Keeps per-row ordering by partitioning on primary key.",
+          "Lets many sinks consume independently at their own pace.",
+          "Compacts to the latest value per key for bootstrapping new sinks."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Topic partition count changed",
+            "impact": "Keys move partitions, so ordering breaks.",
+            "mitigation": "Choose partition counts up front; migrate with a new topic."
+          },
+          {
+            "scenario": "Delete events compacted too early",
+            "impact": "A new sink never learns a row was deleted.",
+            "mitigation": "Tombstone retention long enough for consumers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sinks",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Downstream Sinks",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["Elasticsearch", "Redis cache", "Snowflake / lakehouse"],
+        "io": {
+          "input": [{ "name": "Changes", "type": "Upserts and deletes by key" }],
+          "output": [{ "name": "Derived views", "type": "Search index, cache, analytics tables" }]
+        },
+        "responsibilities": [
+          "Keep derived copies in sync within seconds.",
+          "Apply events idempotently, ignoring older versions.",
+          "Rebuild from a snapshot plus the stream when needed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Out-of-order apply across partitions",
+            "impact": "Joined views briefly inconsistent.",
+            "mitigation": "Design per-entity views; tolerate eventual consistency."
+          },
+          {
+            "scenario": "Sink lags far behind",
+            "impact": "Search shows old order status.",
+            "mitigation": "Lag monitoring and scaling consumers per partition."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-db", "source": "app", "sourceHandle": "r", "target": "db", "targetHandle": "l", "data": { "flow": "commit", "payload": "UPDATE … COMMIT", "steps": [1] } },
+    { "id": "e-db-connector", "source": "db", "sourceHandle": "r", "target": "connector", "targetHandle": "l", "data": { "flow": "capture", "payload": "WAL via slot ⇄ ack LSN", "steps": [2, 6, 7], "bidirectional": true } },
+    { "id": "e-connector-registry", "source": "connector", "sourceHandle": "t", "target": "registry", "targetHandle": "l", "data": { "flow": "capture", "payload": "register schema", "steps": [3], "bidirectional": true } },
+    { "id": "e-connector-topics", "source": "connector", "sourceHandle": "b", "target": "topics", "targetHandle": "l", "data": { "flow": "capture", "payload": "keyed change events", "steps": [4] } },
+    { "id": "e-topics-sinks", "source": "topics", "sourceHandle": "r", "target": "sinks", "targetHandle": "b", "data": { "flow": "deliver", "payload": "consume + upsert", "steps": [5] } },
+    { "id": "e-registry-sinks", "source": "registry", "sourceHandle": "r", "target": "sinks", "targetHandle": "t", "data": { "flow": "deliver", "payload": "decode by schema ID", "steps": [5] } }
+  ]
+}

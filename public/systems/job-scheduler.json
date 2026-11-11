@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "id": "job-scheduler",
+  "title": "Distributed Job Scheduler",
+  "summary": "A distributed job scheduler is cron for thousands of machines. It must fire each job once, on time, even when scheduler nodes crash, and recover cleanly when workers die mid-job. The usual design is a single leader, chosen by a lease, that creates one uniquely keyed run per scheduled time, a queue that hands runs to workers on a timed lease, and heartbeats that let stuck runs be retried.",
+  "flows": {
+    "schedule": { "label": "Scheduling", "color": "#a78bfa" },
+    "execute": { "label": "Execution", "color": "#38bdf8" },
+    "recover": { "label": "Monitoring & recovery", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Define a job", "text": "A team registers nightly-invoices: cron 0 2 * * * in UTC, a 2-hour timeout, up to 3 retries, and a policy for missed runs." },
+    { "step": 2, "title": "Elect a leader", "text": "Several scheduler replicas compete for a lease row in the job store. Only the holder schedules, and it must renew the lease every few seconds or another replica takes over." },
+    { "step": 3, "title": "Create due runs exactly once", "text": "Each tick, the leader finds jobs whose next fire time has passed and inserts a run keyed by (job_id, scheduled_time). The unique key means a crashed and restarted leader cannot create the same run twice." },
+    { "step": 4, "title": "Enqueue the run", "text": "The run is placed on a ready queue with its priority and concurrency group, so at most one nightly-invoices run executes at a time." },
+    { "step": 5, "title": "Worker leases the run", "text": "A worker claims the run with a visibility timeout. If the worker disappears, the lease expires and the run becomes available again." },
+    { "step": 6, "title": "Heartbeat and complete", "text": "The worker heartbeats while running, extending its lease, then reports success or failure with logs and duration to the run history." },
+    { "step": 7, "title": "Retry, alert, catch up", "text": "Failed or timed-out runs retry with exponential backoff. After the final attempt the owner is alerted. Runs missed while the system was down are run once or skipped, per the job's policy." }
+  ],
+  "nodes": [
+    {
+      "id": "clients",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Job Definitions",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["API / UI / config-as-code"],
+        "io": {
+          "input": [{ "name": "Status", "type": "Run history, next fire time, failures" }],
+          "output": [{ "name": "Job", "type": "{ name, cron, tz, timeout, retries, catchup }" }]
+        },
+        "responsibilities": [
+          "Declare what runs, when, and how failures are handled.",
+          "Make jobs idempotent so a retry is safe.",
+          "Own alerts for their jobs."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cron in local time across a DST change",
+            "impact": "Job runs twice or not at all that night.",
+            "mitigation": "Schedule in UTC or use DST-aware rules explicitly."
+          },
+          {
+            "scenario": "Non-idempotent job retried",
+            "impact": "Customers invoiced twice.",
+            "mitigation": "Pass the run ID; jobs deduplicate work by it."
+          }
+        ]
+      }
+    },
+    {
+      "id": "scheduler",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Scheduler (Leader)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Lease-based leader election", "Tick loop"],
+        "io": {
+          "input": [{ "name": "Due jobs", "type": "SELECT … WHERE next_fire <= now()" }],
+          "output": [{ "name": "Runs", "type": "INSERT run (job, scheduled_time) ON CONFLICT DO NOTHING" }]
+        },
+        "responsibilities": [
+          "Is the only replica creating runs at any moment.",
+          "Computes next fire times from cron expressions.",
+          "Hands runs to the queue and advances schedules."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Leader pauses (GC) past its lease, then resumes",
+            "impact": "Two leaders schedule at once.",
+            "mitigation": "Fencing token on writes; the unique run key absorbs duplicates."
+          },
+          {
+            "scenario": "Thousands of jobs at midnight",
+            "impact": "Thundering herd on workers and downstream systems.",
+            "mitigation": "Add jitter to schedules; per-group concurrency limits."
+          }
+        ]
+      }
+    },
+    {
+      "id": "store",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Job & Run Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres / etcd", "Unique (job, scheduled_time)"],
+        "io": {
+          "input": [{ "name": "Writes", "type": "Lease renewals, new runs, state changes" }],
+          "output": [{ "name": "State", "type": "Jobs, runs, leases, attempts" }]
+        },
+        "responsibilities": [
+          "Holds definitions, the leader lease, and every run's state.",
+          "Guarantees one run per job per scheduled time.",
+          "Keeps history for audit and debugging."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Store unavailable",
+            "impact": "No new runs scheduled.",
+            "mitigation": "HA database; catch-up policy when it returns."
+          },
+          {
+            "scenario": "Run history grows forever",
+            "impact": "Slow queries.",
+            "mitigation": "Partition and archive old runs."
+          }
+        ]
+      }
+    },
+    {
+      "id": "queue",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Ready Queue",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["SQS / Redis / DB queue", "Visibility timeouts"],
+        "io": {
+          "input": [{ "name": "Runs", "type": "Ready runs with priority + concurrency key" }],
+          "output": [{ "name": "Leases", "type": "Run handed to one worker for N minutes" }]
+        },
+        "responsibilities": [
+          "Delivers each run to one worker at a time.",
+          "Makes runs available again if a lease expires.",
+          "Enforces priorities and concurrency limits."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Lease shorter than job duration",
+            "impact": "A second worker starts the same run.",
+            "mitigation": "Heartbeats extend the lease; size timeouts to the job."
+          },
+          {
+            "scenario": "Backlog from slow workers",
+            "impact": "Jobs start late.",
+            "mitigation": "Autoscale workers on queue depth and age."
+          }
+        ]
+      }
+    },
+    {
+      "id": "workers",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Worker Pool",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Containers / k8s Jobs", "Heartbeats"],
+        "io": {
+          "input": [{ "name": "Lease", "type": "{ runId, job, attempt, deadline }" }],
+          "output": [{ "name": "Result", "type": "success / failure + logs, duration" }]
+        },
+        "responsibilities": [
+          "Executes runs in isolated environments.",
+          "Heartbeats while running so stuck runs are detectable.",
+          "Stops cleanly at the timeout."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Worker hangs but heartbeats keep going",
+            "impact": "Run never finishes.",
+            "mitigation": "Hard timeouts enforced by the platform, not just the worker."
+          },
+          {
+            "scenario": "Worker killed mid-run",
+            "impact": "Partial work left behind.",
+            "mitigation": "Idempotent, resumable jobs with checkpoints."
+          }
+        ]
+      }
+    },
+    {
+      "id": "monitor",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Run Monitor & Alerts",
+        "layer": "gateway",
+        "criticality": "async",
+        "tech": ["Retry policy engine", "Pager integration"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Heartbeats, results, missed deadlines" }],
+          "output": [{ "name": "Actions", "type": "Retry with backoff, alert owner, mark failed" }]
+        },
+        "responsibilities": [
+          "Detects failed, timed-out, and missed runs.",
+          "Schedules retries with backoff.",
+          "Alerts owners when a job keeps failing or did not run."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Silent non-execution (job never fired)",
+            "impact": "Nobody notices for weeks.",
+            "mitigation": "Alert on 'expected run did not complete by time X'."
+          },
+          {
+            "scenario": "Retry storm against a broken dependency",
+            "impact": "Makes the outage worse.",
+            "mitigation": "Exponential backoff with jitter and retry caps."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-clients-scheduler", "source": "clients", "sourceHandle": "r", "target": "scheduler", "targetHandle": "l", "data": { "flow": "schedule", "payload": "register job", "steps": [1] } },
+    { "id": "e-scheduler-store", "source": "scheduler", "sourceHandle": "t", "target": "store", "targetHandle": "l", "data": { "flow": "schedule", "payload": "lease · create run (unique)", "steps": [2, 3], "bidirectional": true } },
+    { "id": "e-scheduler-queue", "source": "scheduler", "sourceHandle": "b", "target": "queue", "targetHandle": "l", "data": { "flow": "execute", "payload": "enqueue run", "steps": [4] } },
+    { "id": "e-queue-workers", "source": "queue", "sourceHandle": "r", "target": "workers", "targetHandle": "l", "data": { "flow": "execute", "payload": "lease (visibility timeout)", "steps": [5], "bidirectional": true } },
+    { "id": "e-workers-monitor", "source": "workers", "sourceHandle": "t", "target": "monitor", "targetHandle": "b", "data": { "flow": "recover", "payload": "heartbeats + result", "steps": [6] } },
+    { "id": "e-monitor-store", "source": "monitor", "sourceHandle": "l", "target": "store", "targetHandle": "r", "data": { "flow": "recover", "payload": "retry / fail / alert", "steps": [7] } }
+  ]
+}

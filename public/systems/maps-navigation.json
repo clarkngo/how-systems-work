@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "maps-navigation",
+  "title": "Maps & Navigation",
+  "summary": "A maps app does three different jobs. It draws the map from pre-cut vector tiles cached at the edge. It finds routes across a road graph of hundreds of millions of segments in milliseconds, using precomputed shortcuts (contraction hierarchies). And it predicts arrival times from live traffic, measured largely from the GPS traces of the phones that are navigating, which feeds back into every route.",
+  "flows": {
+    "map": { "label": "Map display", "color": "#a78bfa" },
+    "route": { "label": "Routing", "color": "#38bdf8" },
+    "traffic": { "label": "Live traffic", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Draw the map", "text": "As the user pans, the app requests vector tiles by zoom/x/y. Tiles are pre-generated and served from a CDN, and the phone renders and styles them itself." },
+    { "step": 2, "title": "Request a route", "text": "The user asks for directions home. The request includes start, destination, travel mode, and departure time." },
+    { "step": 3, "title": "Search the graph with shortcuts", "text": "The routing engine searches a road graph with contraction hierarchies, shortcut edges precomputed offline, so a cross-country route explores thousands of nodes instead of millions." },
+    { "step": 4, "title": "Return routes with ETAs", "text": "Alternatives are scored by predicted travel time using current segment speeds and returned with turn-by-turn instructions." },
+    { "step": 5, "title": "Phones report GPS probes", "text": "While navigating, phones send anonymised location traces every few seconds." },
+    { "step": 6, "title": "Turn probes into live speeds", "text": "Traces are map-matched to road segments to compute live speeds. A model blends these with historical patterns to predict speeds for the next hour, and the routing graph's edge weights update every minute." },
+    { "step": 7, "title": "Reroute on the fly", "text": "If a crash slows the current route and a faster one appears, the app is offered a reroute mid-trip." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Maps App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Vector tile renderer", "GPS + sensors"],
+        "io": {
+          "input": [{ "name": "Data", "type": "Tiles, routes, ETAs, reroute offers" }],
+          "output": [{ "name": "Requests", "type": "Tile fetches, route requests, GPS probes" }]
+        },
+        "responsibilities": [
+          "Renders tiles smoothly and caches them for offline use.",
+          "Guides turn by turn and detects when the user leaves the route.",
+          "Sends privacy-preserving location probes while navigating."
+        ],
+        "failureModes": [
+          {
+            "scenario": "GPS drift in tunnels and cities",
+            "impact": "Wrong turn prompts.",
+            "mitigation": "Dead reckoning with sensors; snap to the road graph."
+          },
+          {
+            "scenario": "No signal mid-route",
+            "impact": "Navigation stops.",
+            "mitigation": "Download route and tiles ahead; offline maps."
+          }
+        ]
+      }
+    },
+    {
+      "id": "gateway",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Maps API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["API gateway", "Session tracking"],
+        "io": {
+          "input": [{ "name": "Client calls", "type": "Tiles, directions, probes" }],
+          "output": [{ "name": "Routed calls", "type": "To tile CDN, routing engine, traffic ingest" }]
+        },
+        "responsibilities": [
+          "Authenticates and rate-limits clients.",
+          "Routes each request type to the right service.",
+          "Tracks active navigation sessions for rerouting."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Routing slow at rush hour",
+            "impact": "Users wait for directions.",
+            "mitigation": "Autoscale routing; cache popular routes for short periods."
+          },
+          {
+            "scenario": "Location probes identify individuals",
+            "impact": "Privacy breach.",
+            "mitigation": "Rotate probe IDs, trim trip start and end, aggregate before storage."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tiles",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Tile Service & CDN",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Vector tiles (MVT)", "CDN cached"],
+        "io": {
+          "input": [{ "name": "Request", "type": "GET /tiles/14/8185/5449.mvt" }],
+          "output": [{ "name": "Tile", "type": "Compressed roads, labels, buildings for one square" }]
+        },
+        "responsibilities": [
+          "Pre-generates tiles for every zoom level from map data.",
+          "Serves almost entirely from CDN cache.",
+          "Republishes tiles when map data changes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Map data error published",
+            "impact": "Missing roads or wrong names everywhere.",
+            "mitigation": "Validation pipelines and staged tile rollouts."
+          },
+          {
+            "scenario": "Cache purge after a data release",
+            "impact": "Origin overloaded.",
+            "mitigation": "Versioned tile URLs instead of purges."
+          }
+        ]
+      }
+    },
+    {
+      "id": "routing",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Routing Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Contraction hierarchies", "Customisable edge weights"],
+        "io": {
+          "input": [{ "name": "Query", "type": "from, to, mode, depart_at" }],
+          "output": [{ "name": "Routes", "type": "Up to 3 alternatives with ETAs and steps" }]
+        },
+        "responsibilities": [
+          "Finds fastest routes in milliseconds over a continent-sized graph.",
+          "Applies restrictions: turns, tolls, truck limits.",
+          "Generates alternative routes that are meaningfully different."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Precomputation too slow for live traffic",
+            "impact": "Routes ignore current congestion.",
+            "mitigation": "Customisable CH: keep the structure, update weights in seconds."
+          },
+          {
+            "scenario": "Wrong turn restriction in data",
+            "impact": "Illegal or impossible routes.",
+            "mitigation": "User reports and probe evidence correct the map."
+          }
+        ]
+      }
+    },
+    {
+      "id": "traffic",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Probe Ingest & Map Matching",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Stream processing", "HMM map matching"],
+        "io": {
+          "input": [{ "name": "Probes", "type": "(anon_id, lat, lng, speed, ts) every few seconds" }],
+          "output": [{ "name": "Segment speeds", "type": "Live speed per road segment" }]
+        },
+        "responsibilities": [
+          "Matches noisy GPS points to the road actually travelled.",
+          "Aggregates speeds per segment over short windows.",
+          "Detects incidents from sudden slowdowns."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Few probes on a minor road",
+            "impact": "Speed estimates are noisy or missing.",
+            "mitigation": "Fall back to historical speeds; require minimum sample counts."
+          },
+          {
+            "scenario": "Fake probes (e.g. 99 phones in a wagon)",
+            "impact": "Phantom traffic jams.",
+            "mitigation": "Device and pattern anomaly detection."
+          }
+        ]
+      }
+    },
+    {
+      "id": "graph",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Road Graph",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Nodes = intersections, edges = segments", "In-memory per region"],
+        "io": {
+          "input": [{ "name": "Weights", "type": "Predicted travel time per edge, refreshed each minute" }],
+          "output": [{ "name": "Graph", "type": "Edges + shortcuts + current weights" }]
+        },
+        "responsibilities": [
+          "Holds the road network with attributes and restrictions.",
+          "Stores precomputed shortcut edges.",
+          "Applies fresh edge weights without rebuilding."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Weight update fails",
+            "impact": "Routes use stale traffic.",
+            "mitigation": "Alert on staleness; fall back to historical weights."
+          },
+          {
+            "scenario": "Road closure not in the graph",
+            "impact": "Users routed into a closed road.",
+            "mitigation": "Ingest closure feeds and probe-detected closures."
+          }
+        ]
+      }
+    },
+    {
+      "id": "eta",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Speed & ETA Models",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Historical profiles", "Graph neural network"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Live speeds + time of day + events + weather" }],
+          "output": [{ "name": "Predictions", "type": "Edge travel times for the next hour" }]
+        },
+        "responsibilities": [
+          "Predicts how traffic will evolve, not just how it is now.",
+          "Blends live data with typical weekly patterns.",
+          "Is measured against actual trip times."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Unusual event (concert, storm)",
+            "impact": "ETAs badly wrong.",
+            "mitigation": "Event-aware features; weight live data more heavily when patterns break."
+          },
+          {
+            "scenario": "Feedback loop: everyone rerouted onto one side street",
+            "impact": "New jam created by the app.",
+            "mitigation": "Spread recommendations; account for routed volume."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-gateway", "source": "app", "sourceHandle": "r", "target": "gateway", "targetHandle": "l", "data": { "flow": "route", "payload": "tiles · route · probes", "steps": [1, 2, 4, 5, 7], "bidirectional": true } },
+    { "id": "e-gateway-tiles", "source": "gateway", "sourceHandle": "t", "target": "tiles", "targetHandle": "l", "data": { "flow": "map", "payload": "vector tiles", "steps": [1], "bidirectional": true } },
+    { "id": "e-gateway-routing", "source": "gateway", "sourceHandle": "b", "target": "routing", "targetHandle": "l", "data": { "flow": "route", "payload": "route ⇄ alternatives + ETA", "steps": [2, 4, 7], "bidirectional": true } },
+    { "id": "e-routing-graph", "source": "routing", "sourceHandle": "r", "target": "graph", "targetHandle": "l", "data": { "flow": "route", "payload": "CH search", "steps": [3], "bidirectional": true } },
+    { "id": "e-gateway-traffic", "source": "gateway", "sourceHandle": "r", "target": "traffic", "targetHandle": "b", "data": { "flow": "traffic", "payload": "GPS probes", "steps": [5] } },
+    { "id": "e-traffic-eta", "source": "traffic", "sourceHandle": "r", "target": "eta", "targetHandle": "t", "data": { "flow": "traffic", "payload": "live segment speeds", "steps": [6] } },
+    { "id": "e-eta-graph", "source": "eta", "sourceHandle": "b", "target": "graph", "targetHandle": "r", "data": { "flow": "traffic", "payload": "edge weights (every min)", "steps": [6] } }
+  ]
+}

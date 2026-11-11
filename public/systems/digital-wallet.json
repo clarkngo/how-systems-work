@@ -1,0 +1,258 @@
+{
+  "schemaVersion": 1,
+  "id": "digital-wallet",
+  "title": "Digital Wallet & P2P Transfers",
+  "summary": "A digital wallet like Venmo or PayPal makes sending money between people feel instant, even though moving money between banks takes days. The trick is that both users' balances live in the company's own ledger, so a person-to-person transfer is just an atomic database entry. The slow, risky parts, such as verifying identity, catching fraud, and moving cash in and out of real bank accounts, happen around that core.",
+  "flows": {
+    "transfer": { "label": "P2P transfer", "color": "#38bdf8" },
+    "risk": { "label": "Identity & risk", "color": "#fbbf24" },
+    "rails": { "label": "Bank rails", "color": "#a78bfa" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Send money", "text": "Ana taps 'Send $20 to Sam' with a note. The app sends the request with an idempotency key so a retry cannot send twice." },
+    { "step": 2, "title": "Check identity, limits, and risk", "text": "The wallet confirms Ana's KYC level allows this amount, checks daily limits, and scores fraud risk (new device, unusual recipient). High risk may require step-up verification." },
+    { "step": 3, "title": "Start the transfer", "text": "The transfer orchestrator records the transfer as PENDING with the idempotency key." },
+    { "step": 4, "title": "Move balances atomically", "text": "In one database transaction the ledger debits Ana's wallet account and credits Sam's, with double-entry lines and a balance check. No bank is involved, so it is instant." },
+    { "step": 5, "title": "Notify the recipient", "text": "Sam gets a push notification that $20 arrived. Their balance is usable immediately." },
+    { "step": 6, "title": "Show the result", "text": "Ana's app shows COMPLETED and her new balance, read from the ledger." },
+    { "step": 7, "title": "Cash out to a bank", "text": "When Sam withdraws, the money leaves over ACH (1-3 days), real-time payments, or a push-to-card. The ledger shows it as pending until the rail confirms, and returns are reversed." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Wallet App",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["iOS / Android", "Device binding"],
+        "io": {
+          "input": [{ "name": "Status", "type": "Balance, transfer status, notifications" }],
+          "output": [{ "name": "Request", "type": "POST /transfers { to: @sam, amount: 2000, idempotencyKey }" }]
+        },
+        "responsibilities": [
+          "Authenticates the user strongly (biometrics, device binding).",
+          "Sends transfers with idempotency keys.",
+          "Shows clear pending vs completed states."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Wrong recipient",
+            "impact": "Money sent to a stranger; hard to recover.",
+            "mitigation": "Show the recipient's name and photo, and confirm on first send."
+          },
+          {
+            "scenario": "Account takeover",
+            "impact": "Attacker drains the balance.",
+            "mitigation": "Device binding, step-up auth for new payees, velocity limits."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Wallet API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Auth + rate limiting", "Idempotency store"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Authenticated transfer / balance call" }],
+          "output": [
+            { "name": "Checks", "type": "KYC tier, limits, risk score" },
+            { "name": "Command", "type": "CreateTransfer to orchestrator" }
+          ]
+        },
+        "responsibilities": [
+          "Authenticates and rate-limits every call.",
+          "Deduplicates by idempotency key.",
+          "Runs risk and limit checks before money moves."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retry creates a second transfer",
+            "impact": "User charged twice.",
+            "mitigation": "Store idempotency key with the result; return it on retries."
+          },
+          {
+            "scenario": "Risk service slow",
+            "impact": "Transfers stall.",
+            "mitigation": "Strict timeout; allow small low-risk transfers, hold large ones."
+          }
+        ]
+      }
+    },
+    {
+      "id": "kyc",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "KYC, Limits & Fraud",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Identity verification", "Sanctions screening", "Risk model"],
+        "io": {
+          "input": [{ "name": "Check", "type": "user, amount, recipient, device, history" }],
+          "output": [{ "name": "Decision", "type": "allow / step-up / hold / block" }]
+        },
+        "responsibilities": [
+          "Verifies identity at onboarding and raises limits with more verification.",
+          "Screens against sanctions lists (AML compliance).",
+          "Scores each transfer for fraud and money-mule patterns."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Scam: victim tricked into sending",
+            "impact": "Authorised push payment fraud; reimbursement may be required.",
+            "mitigation": "Warnings for risky payees, delays for first large transfers, mule detection."
+          },
+          {
+            "scenario": "False positives block legitimate users",
+            "impact": "Frustration and churn.",
+            "mitigation": "Graduated responses (step-up rather than block) and fast review."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ledger",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Wallet Ledger",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Double-entry", "Postgres / Spanner"],
+        "io": {
+          "input": [{ "name": "Posting", "type": "Debit ana:wallet 2000, credit sam:wallet 2000" }],
+          "output": [{ "name": "Balances", "type": "available / pending per wallet" }]
+        },
+        "responsibilities": [
+          "Holds every user's balance as ledger accounts.",
+          "Applies transfers atomically with no negative balances.",
+          "Tracks pending funds from bank rails separately."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Concurrent spends from one wallet",
+            "impact": "Balance goes negative.",
+            "mitigation": "Row locks or conditional updates on balance."
+          },
+          {
+            "scenario": "Ledger and bank disagree",
+            "impact": "Customer funds not fully backed.",
+            "mitigation": "Daily reconciliation of the pooled bank account against total wallet balances."
+          }
+        ]
+      }
+    },
+    {
+      "id": "transfers",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Transfer Orchestrator",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["State machine", "Outbox events"],
+        "io": {
+          "input": [{ "name": "CreateTransfer", "type": "{ from, to, amount, key }" }],
+          "output": [{ "name": "Effects", "type": "Ledger posting, notifications, bank payouts" }]
+        },
+        "responsibilities": [
+          "Drives each transfer through its states: PENDING → COMPLETED or FAILED.",
+          "Publishes events reliably through a transactional outbox.",
+          "Handles payouts that take days and may be returned."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ledger posted but event not published",
+            "impact": "Recipient never notified.",
+            "mitigation": "Outbox written in the same transaction as the posting."
+          },
+          {
+            "scenario": "Payout returned days later",
+            "impact": "Money already spent from the wallet.",
+            "mitigation": "Hold periods for new users; negative balance recovery."
+          }
+        ]
+      }
+    },
+    {
+      "id": "bank",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Bank Rails",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["ACH / RTP / FedNow", "Card push (Visa Direct)"],
+        "io": {
+          "input": [{ "name": "Payout / top-up", "type": "Move $X to or from a linked account" }],
+          "output": [{ "name": "Status", "type": "settled / returned (R01 insufficient funds)" }]
+        },
+        "responsibilities": [
+          "Move real money in and out of the wallet's pooled bank account.",
+          "Settle in seconds (RTP) or days (ACH).",
+          "Report returns and failures."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Top-up via ACH bounces after funds were spent",
+            "impact": "Platform loses money.",
+            "mitigation": "Treat ACH top-ups as pending; limit spending until they clear."
+          },
+          {
+            "scenario": "Rail outage",
+            "impact": "Cash-outs delayed.",
+            "mitigation": "Queue and retry; offer alternative rails."
+          }
+        ]
+      }
+    },
+    {
+      "id": "recipient",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Recipient Notifications",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Push / SMS", "Activity feed"],
+        "io": {
+          "input": [{ "name": "Event", "type": "TransferCompleted { from: Ana, amount, note }" }],
+          "output": [{ "name": "Message", "type": "'Ana sent you $20 🍕'" }]
+        },
+        "responsibilities": [
+          "Tells the recipient that money arrived.",
+          "Updates both users' activity feeds.",
+          "Respects privacy settings for public feeds."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Notification arrives before balance updates",
+            "impact": "Recipient sees the old balance and is confused.",
+            "mitigation": "Notify only after the ledger commit (outbox)."
+          },
+          {
+            "scenario": "Public feed leaks private payments",
+            "impact": "Privacy harm.",
+            "mitigation": "Private by default; clear visibility controls."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-api", "source": "app", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "transfer", "payload": "send ⇄ status", "steps": [1, 6], "bidirectional": true } },
+    { "id": "e-api-kyc", "source": "api", "sourceHandle": "t", "target": "kyc", "targetHandle": "l", "data": { "flow": "risk", "payload": "KYC + limits + risk", "steps": [2], "bidirectional": true } },
+    { "id": "e-api-ledger", "source": "api", "sourceHandle": "b", "target": "ledger", "targetHandle": "l", "data": { "flow": "transfer", "payload": "balance read", "steps": [6], "bidirectional": true } },
+    { "id": "e-api-transfers", "source": "api", "sourceHandle": "r", "target": "transfers", "targetHandle": "l", "data": { "flow": "transfer", "payload": "CreateTransfer", "steps": [3] } },
+    { "id": "e-transfers-ledger", "source": "transfers", "sourceHandle": "b", "target": "ledger", "targetHandle": "r", "data": { "flow": "transfer", "payload": "debit + credit (one txn)", "steps": [4], "bidirectional": true } },
+    { "id": "e-transfers-recipient", "source": "transfers", "sourceHandle": "r", "target": "recipient", "targetHandle": "l", "data": { "flow": "transfer", "payload": "notify", "steps": [5] } },
+    { "id": "e-transfers-bank", "source": "transfers", "sourceHandle": "r", "target": "bank", "targetHandle": "l", "data": { "flow": "rails", "payload": "cash out / top up", "steps": [7], "bidirectional": true } }
+  ]
+}

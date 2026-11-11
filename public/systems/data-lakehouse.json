@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "data-lakehouse",
+  "title": "Data Lakehouse",
+  "summary": "A lakehouse puts warehouse-style tables on top of cheap object storage. Data lives as open Parquet files in S3, and a table format such as Apache Iceberg adds a metadata layer that tracks exactly which files make up each version of a table. That gives atomic commits, schema evolution, and time travel, and lets many engines (Spark, Trino, Snowflake, Python) safely read and write the same tables without copying data.",
+  "flows": {
+    "write": { "label": "Ingestion & commits", "color": "#a78bfa" },
+    "read": { "label": "Query planning & reads", "color": "#38bdf8" },
+    "consume": { "label": "Consumers", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Ingest from sources", "text": "Change data capture from production databases, event streams, and SaaS exports flow into ingestion jobs every few minutes." },
+    { "step": 2, "title": "Write Parquet data files", "text": "The job writes new immutable Parquet files to object storage, organised by partition such as event date. Nothing existing is modified in place." },
+    { "step": 3, "title": "Commit a new snapshot atomically", "text": "The job writes new manifest files listing the data files, then asks the catalog to swap the table's current-metadata pointer with compare-and-swap. Readers see all of the commit or none of it." },
+    { "step": 4, "title": "Plan a query from metadata", "text": "Trino asks the catalog for the table's current snapshot. Using per-file min/max statistics in the manifests, it skips files that cannot match WHERE order_date = '2026-11-01'." },
+    { "step": 5, "title": "Read only what is needed", "text": "Workers read just the surviving files, and only the needed columns, in parallel straight from object storage." },
+    { "step": 6, "title": "Serve BI and ML from the same tables", "text": "Dashboards, notebooks, and training jobs all read the same governed tables, with no exports or copies." },
+    { "step": 7, "title": "Compact and expire", "text": "Maintenance jobs rewrite many small files into larger ones and expire old snapshots after the time-travel window, deleting files no snapshot references." }
+  ],
+  "nodes": [
+    {
+      "id": "sources",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Sources",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["OLTP databases (CDC)", "Kafka", "SaaS exports"],
+        "io": {
+          "input": [{ "name": "Business activity", "type": "Orders, users, events" }],
+          "output": [{ "name": "Changes", "type": "Row changes, events, files" }]
+        },
+        "responsibilities": [
+          "Produce the raw data the lakehouse organises.",
+          "Expose changes incrementally rather than full dumps.",
+          "Publish schemas and data contracts."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Breaking schema change upstream",
+            "impact": "Ingestion fails or silently drops columns.",
+            "mitigation": "Data contracts; schema evolution rules; alerting."
+          },
+          {
+            "scenario": "Full nightly dumps",
+            "impact": "Slow, expensive, and stale.",
+            "mitigation": "CDC for incremental, near-real-time updates."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ingest",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Ingestion Jobs",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Spark / Flink", "MERGE INTO upserts"],
+        "io": {
+          "input": [{ "name": "Changes", "type": "Micro-batches of inserts / updates / deletes" }],
+          "output": [{ "name": "Commit", "type": "New data files + manifests → snapshot" }]
+        },
+        "responsibilities": [
+          "Writes data files and commits them atomically.",
+          "Applies upserts and deletes (merge-on-read or copy-on-write).",
+          "Retries commits that conflict with concurrent writers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Job crashes after writing files, before commit",
+            "impact": "Orphan files take up space (but readers are unaffected).",
+            "mitigation": "Orphan-file cleanup; the commit is all-or-nothing."
+          },
+          {
+            "scenario": "Two writers commit at once",
+            "impact": "One commit conflicts.",
+            "mitigation": "Optimistic concurrency: retry on a fresh snapshot if files do not overlap."
+          }
+        ]
+      }
+    },
+    {
+      "id": "catalog",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Catalog & Table Metadata",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Iceberg REST catalog / Unity / Glue", "Manifests + snapshots"],
+        "io": {
+          "input": [{ "name": "Commit", "type": "CAS: current-metadata v41 → v42" }],
+          "output": [{ "name": "Table state", "type": "Schema, partitions, snapshot → manifest list" }]
+        },
+        "responsibilities": [
+          "Points each table name to its current metadata file.",
+          "Makes commits atomic with compare-and-swap.",
+          "Enforces access control and keeps schema history."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Catalog outage",
+            "impact": "No new commits or query planning.",
+            "mitigation": "Highly available catalog service; data files remain safe in storage."
+          },
+          {
+            "scenario": "Engines use different catalogs",
+            "impact": "Split-brain views of the same table.",
+            "mitigation": "One shared catalog for all engines."
+          }
+        ]
+      }
+    },
+    {
+      "id": "storage",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Object Storage",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["S3 / GCS / ADLS", "Parquet files"],
+        "io": {
+          "input": [{ "name": "Files", "type": "Immutable Parquet data + metadata files" }],
+          "output": [{ "name": "Reads", "type": "Byte-range GETs for needed columns" }]
+        },
+        "responsibilities": [
+          "Stores all table data cheaply and durably.",
+          "Scales reads across thousands of parallel workers.",
+          "Separates storage from compute so each scales independently."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Request rate limits on one prefix",
+            "impact": "Throttled reads during big scans.",
+            "mitigation": "Spread files across prefixes; fewer, larger files."
+          },
+          {
+            "scenario": "Accidental bucket deletion",
+            "impact": "Data loss.",
+            "mitigation": "Versioning, object lock, and cross-region replication."
+          }
+        ]
+      }
+    },
+    {
+      "id": "engines",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Query Engines",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Trino / Spark / DuckDB", "Predicate pushdown"],
+        "io": {
+          "input": [{ "name": "SQL", "type": "SELECT … WHERE order_date = '2026-11-01'" }],
+          "output": [{ "name": "Results", "type": "Rows, after pruning files with metadata" }]
+        },
+        "responsibilities": [
+          "Plan queries from metadata, skipping irrelevant files.",
+          "Read columns in parallel directly from storage.",
+          "Run maintenance: compaction and snapshot expiry."
+        ],
+        "failureModes": [
+          {
+            "scenario": "No partition or column stats to prune with",
+            "impact": "Full scans of terabytes for small queries.",
+            "mitigation": "Good partitioning, sort order, and file statistics."
+          },
+          {
+            "scenario": "Many small files from streaming",
+            "impact": "Planning and reads slow down.",
+            "mitigation": "Scheduled compaction to ~512 MB files."
+          }
+        ]
+      }
+    },
+    {
+      "id": "bi",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "BI & SQL Users",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Looker / Tableau", "dbt models"],
+        "io": {
+          "input": [{ "name": "Results", "type": "Governed tables and metrics" }],
+          "output": [{ "name": "Queries", "type": "Dashboards and ad-hoc SQL" }]
+        },
+        "responsibilities": [
+          "Build reports and business metrics.",
+          "Transform raw tables into modelled ones with dbt.",
+          "Use time travel to reproduce past numbers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Querying raw tables directly",
+            "impact": "Inconsistent definitions of 'revenue'.",
+            "mitigation": "Curated, documented layers (bronze/silver/gold)."
+          },
+          {
+            "scenario": "Runaway query",
+            "impact": "Cluster costs spike.",
+            "mitigation": "Resource groups, quotas, and query timeouts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ml",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "ML & Notebooks",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Python / PySpark", "Feature pipelines"],
+        "io": {
+          "input": [{ "name": "Tables", "type": "Same tables, read by snapshot ID" }],
+          "output": [{ "name": "Datasets", "type": "Reproducible training sets" }]
+        },
+        "responsibilities": [
+          "Read the same tables as BI, no exports.",
+          "Pin snapshot IDs so training data is reproducible.",
+          "Write features back as new tables."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Snapshot expired before retraining",
+            "impact": "Cannot reproduce a model's data.",
+            "mitigation": "Tag snapshots used for training to exempt them from expiry."
+          },
+          {
+            "scenario": "Ungoverned copies in notebooks",
+            "impact": "Stale and insecure shadow datasets.",
+            "mitigation": "Access through the catalog with column-level permissions."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-sources-ingest", "source": "sources", "sourceHandle": "r", "target": "ingest", "targetHandle": "l", "data": { "flow": "write", "payload": "CDC + events", "steps": [1] } },
+    { "id": "e-ingest-storage", "source": "ingest", "sourceHandle": "b", "target": "storage", "targetHandle": "l", "data": { "flow": "write", "payload": "new Parquet files", "steps": [2] } },
+    { "id": "e-ingest-catalog", "source": "ingest", "sourceHandle": "t", "target": "catalog", "targetHandle": "l", "data": { "flow": "write", "payload": "atomic commit (CAS)", "steps": [3] } },
+    { "id": "e-catalog-engines", "source": "catalog", "sourceHandle": "r", "target": "engines", "targetHandle": "t", "data": { "flow": "read", "payload": "snapshot + file stats", "steps": [4], "bidirectional": true } },
+    { "id": "e-storage-engines", "source": "storage", "sourceHandle": "r", "target": "engines", "targetHandle": "b", "data": { "flow": "read", "payload": "pruned column reads · compaction", "steps": [5, 7], "bidirectional": true } },
+    { "id": "e-engines-bi", "source": "engines", "sourceHandle": "r", "target": "bi", "targetHandle": "l", "data": { "flow": "consume", "payload": "SQL results", "steps": [6], "bidirectional": true } },
+    { "id": "e-engines-ml", "source": "engines", "sourceHandle": "r", "target": "ml", "targetHandle": "l", "data": { "flow": "consume", "payload": "training data", "steps": [6], "bidirectional": true } }
+  ]
+}

@@ -1,0 +1,257 @@
+{
+  "schemaVersion": 1,
+  "id": "object-storage",
+  "title": "Object Storage",
+  "summary": "Object storage like S3 keeps trillions of files with eleven nines of durability by never trusting any single disk. Each object is split and erasure-coded into fragments spread across racks and data centres, so it survives several simultaneous failures while using far less space than full copies. A separate metadata service maps keys to fragments and makes writes visible atomically, and background processes constantly verify and repair data.",
+  "flows": {
+    "data": { "label": "Data path", "color": "#38bdf8" },
+    "metadata": { "label": "Metadata", "color": "#fbbf24" },
+    "background": { "label": "Background durability", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "PUT an object", "text": "A client sends PUT /photos/cat.jpg with a SigV4-signed request. The front end authenticates it, checks bucket policy, and streams the body in." },
+    { "step": 2, "title": "Erasure-code across fault domains", "text": "The data is split into 8 data fragments plus 4 parity fragments (8+4) and written to 12 storage nodes in different racks and zones. Any 8 fragments can rebuild the object, so it survives 4 losses at 1.5× storage cost instead of 3× for copies." },
+    { "step": 3, "title": "Commit metadata", "text": "Only once enough fragments are durable is the key → fragment-location map committed in the metadata service. From that moment every reader sees the new object (strong read-after-write consistency)." },
+    { "step": 4, "title": "GET the object", "text": "A read looks up the key's metadata, fetches fragments from the fastest nodes in parallel, reconstructs the object, and verifies its checksum before streaming it." },
+    { "step": 5, "title": "Multipart upload for large files", "text": "A 50 GB video is uploaded as many 100 MB parts in parallel and retried individually. A final CompleteMultipartUpload stitches them into one object atomically." },
+    { "step": 6, "title": "Scrub and repair", "text": "Background scrubbers re-read fragments to catch silent corruption (bit rot). When a disk or node dies, the repair service rebuilds its fragments elsewhere from the survivors." },
+    { "step": 7, "title": "Lifecycle and replication", "text": "Lifecycle rules move old objects to colder, cheaper tiers or delete them, and cross-region replication copies objects to another region for disaster recovery." }
+  ],
+  "nodes": [
+    {
+      "id": "client",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Client (S3 API)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["AWS SDK / CLI", "Presigned URLs"],
+        "io": {
+          "input": [{ "name": "Responses", "type": "200 + ETag · object bytes" }],
+          "output": [{ "name": "Requests", "type": "PUT / GET / LIST / multipart upload" }]
+        },
+        "responsibilities": [
+          "Uploads and downloads objects by bucket and key.",
+          "Uses multipart uploads and parallel range GETs for big objects.",
+          "Verifies integrity with checksums."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Public bucket by mistake",
+            "impact": "Sensitive data exposed to the internet.",
+            "mitigation": "Block public access by default; policy scanning."
+          },
+          {
+            "scenario": "Abandoned multipart uploads",
+            "impact": "Invisible parts accumulate storage cost.",
+            "mitigation": "Lifecycle rule to abort incomplete uploads after N days."
+          }
+        ]
+      }
+    },
+    {
+      "id": "frontend",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "API Front End",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Stateless HTTP fleet", "IAM / bucket policy"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Signed HTTP request" }],
+          "output": [
+            { "name": "Data ops", "type": "Fragment writes and reads" },
+            { "name": "Metadata ops", "type": "Lookup / commit key" }
+          ]
+        },
+        "responsibilities": [
+          "Authenticates requests and enforces access policies.",
+          "Encodes and decodes erasure-coded fragments.",
+          "Rate-limits per prefix to protect the system."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hot prefix (all keys start with a date)",
+            "impact": "Throttling (503 SlowDown).",
+            "mitigation": "Automatic prefix partitioning; spread key names."
+          },
+          {
+            "scenario": "Front-end node dies mid-upload",
+            "impact": "Upload fails.",
+            "mitigation": "Nothing visible until commit; client retries the part."
+          }
+        ]
+      }
+    },
+    {
+      "id": "metadata",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Metadata Service",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Sharded, replicated index", "Strong consistency"],
+        "io": {
+          "input": [{ "name": "Commit / lookup", "type": "bucket/key → version, size, ETag, fragment map" }],
+          "output": [{ "name": "Location", "type": "12 fragment locations + checksums" }]
+        },
+        "responsibilities": [
+          "Maps every key to where its fragments live.",
+          "Makes writes atomic and immediately visible.",
+          "Serves LIST by key prefix in sorted order."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Metadata shard unavailable",
+            "impact": "Keys in that range cannot be read or written.",
+            "mitigation": "Consensus-replicated shards across zones."
+          },
+          {
+            "scenario": "Huge LIST of a billion-key bucket",
+            "impact": "Slow, expensive scans.",
+            "mitigation": "Paginated listing; inventory reports for bulk analysis."
+          }
+        ]
+      }
+    },
+    {
+      "id": "storage",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Storage Nodes",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Erasure coding 8+4", "HDDs across racks & zones"],
+        "io": {
+          "input": [{ "name": "Fragments", "type": "Fragment blobs with checksums" }],
+          "output": [{ "name": "Reads", "type": "Any 8 of 12 fragments → original object" }]
+        },
+        "responsibilities": [
+          "Stores fragments on many disks in independent failure domains.",
+          "Serves fragment reads in parallel.",
+          "Reports disk health for proactive replacement."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Correlated failure (rack power loss)",
+            "impact": "Several fragments unavailable at once.",
+            "mitigation": "Place at most a few fragments per rack and zone."
+          },
+          {
+            "scenario": "Slow disk drags out reads",
+            "impact": "Tail latency spikes.",
+            "mitigation": "Read extra fragments and use the first 8 to arrive (hedged reads)."
+          }
+        ]
+      }
+    },
+    {
+      "id": "repair",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Scrubber & Repair",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Continuous checksum scans", "Rebuild scheduler"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Checksum mismatches, failed disks" }],
+          "output": [{ "name": "Repairs", "type": "Rebuilt fragments on healthy nodes" }]
+        },
+        "responsibilities": [
+          "Detects silent corruption before it accumulates.",
+          "Rebuilds lost fragments quickly to restore full redundancy.",
+          "Prioritises objects that have lost the most fragments."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Repair slower than failure rate",
+            "impact": "Durability erodes; data loss risk grows.",
+            "mitigation": "Capacity for repair bandwidth; prioritise most-degraded objects."
+          },
+          {
+            "scenario": "Repair traffic hurts customer latency",
+            "impact": "Slow reads during big rebuilds.",
+            "mitigation": "Throttle repair adaptively; spread it across many nodes."
+          }
+        ]
+      }
+    },
+    {
+      "id": "lifecycle",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Lifecycle & Replication",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Tiering rules", "Async cross-region copy"],
+        "io": {
+          "input": [{ "name": "Rules", "type": "After 30 d → infrequent; 365 d → archive; replicate prefix" }],
+          "output": [{ "name": "Jobs", "type": "Transitions, expirations, replica copies" }]
+        },
+        "responsibilities": [
+          "Moves data to cheaper tiers as it ages.",
+          "Expires objects per retention rules.",
+          "Copies objects to another region asynchronously."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Over-broad expiry rule",
+            "impact": "Important data deleted.",
+            "mitigation": "Versioning plus object lock for critical buckets."
+          },
+          {
+            "scenario": "Replication lag",
+            "impact": "Recent objects missing after a regional failover.",
+            "mitigation": "Replication time control (SLA) and lag monitoring."
+          }
+        ]
+      }
+    },
+    {
+      "id": "region2",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Second Region",
+        "layer": "external",
+        "criticality": "async",
+        "tech": ["Independent storage cluster"],
+        "io": {
+          "input": [{ "name": "Replicas", "type": "Copied objects + metadata" }],
+          "output": [{ "name": "DR reads", "type": "Serve traffic if the primary region fails" }]
+        },
+        "responsibilities": [
+          "Holds an independent copy for disaster recovery.",
+          "Serves nearby readers with lower latency.",
+          "Meets data-residency requirements."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Deletes replicate too",
+            "impact": "Accidental deletion is copied everywhere.",
+            "mitigation": "Versioning and delete-marker policies in the replica."
+          },
+          {
+            "scenario": "Never tested failover",
+            "impact": "DR plan fails when needed.",
+            "mitigation": "Regular failover drills."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-client-frontend", "source": "client", "sourceHandle": "r", "target": "frontend", "targetHandle": "l", "data": { "flow": "data", "payload": "PUT / GET / multipart", "steps": [1, 4, 5], "bidirectional": true } },
+    { "id": "e-frontend-storage", "source": "frontend", "sourceHandle": "b", "target": "storage", "targetHandle": "l", "data": { "flow": "data", "payload": "8+4 erasure-coded fragments", "steps": [2, 4], "bidirectional": true } },
+    { "id": "e-frontend-metadata", "source": "frontend", "sourceHandle": "t", "target": "metadata", "targetHandle": "l", "data": { "flow": "metadata", "payload": "commit / lookup key", "steps": [3, 4], "bidirectional": true } },
+    { "id": "e-storage-repair", "source": "storage", "sourceHandle": "r", "target": "repair", "targetHandle": "l", "data": { "flow": "background", "payload": "scrub + rebuild", "steps": [6], "bidirectional": true } },
+    { "id": "e-metadata-lifecycle", "source": "metadata", "sourceHandle": "r", "target": "lifecycle", "targetHandle": "l", "data": { "flow": "background", "payload": "tier / expire", "steps": [7] } },
+    { "id": "e-lifecycle-region2", "source": "lifecycle", "sourceHandle": "r", "target": "region2", "targetHandle": "l", "data": { "flow": "background", "payload": "cross-region copy", "steps": [7] } }
+  ]
+}

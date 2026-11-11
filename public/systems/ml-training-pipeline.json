@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "id": "ml-training-pipeline",
+  "title": "ML Training & Feature Store",
+  "summary": "A machine-learning platform has to compute features the same way twice: in bulk over history for training, and one row at a time in milliseconds for serving. A feature store bridges the two. Pipelines write each feature once into an offline store for point-in-time-correct training sets and an online store for live lookups. Models move from training through a registry with evaluation gates into serving, and production predictions are monitored for drift.",
+  "flows": {
+    "features": { "label": "Feature computation", "color": "#a78bfa" },
+    "training": { "label": "Training & release", "color": "#38bdf8" },
+    "serving": { "label": "Online serving & monitoring", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Ingest raw data", "text": "Transactions, clickstream events, and database tables arrive as batch files and streams." },
+    { "step": 2, "title": "Compute features once, write twice", "text": "A feature such as user_txn_count_7d is defined once. Batch and streaming jobs compute it and write timestamped history to the offline store and the latest value to the online store." },
+    { "step": 3, "title": "Build a point-in-time training set", "text": "For each training label, the feature store joins each feature's value as of that label's timestamp, never later. That prevents leaking the future into training." },
+    { "step": 4, "title": "Train and register", "text": "GPU jobs train the model. The artifact, its exact data snapshot, code version, and evaluation metrics are logged to the model registry." },
+    { "step": 5, "title": "Gate and deploy", "text": "A model that beats the current version on held-out data and fairness checks is promoted and rolled out to serving as a canary or shadow deployment first." },
+    { "step": 6, "title": "Serve with fresh features", "text": "At request time the serving layer fetches the same features from the online store in a few milliseconds and runs inference." },
+    { "step": 7, "title": "Monitor and retrain", "text": "Predictions, inputs, and later outcomes are logged. Drift in input distributions or falling accuracy triggers alerts and scheduled retraining." }
+  ],
+  "nodes": [
+    {
+      "id": "sources",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Raw Data Sources",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Kafka events", "Warehouse tables"],
+        "io": {
+          "input": [{ "name": "Feedback", "type": "Logged predictions + outcomes (labels)" }],
+          "output": [{ "name": "Raw data", "type": "Events, CDC streams, daily snapshots" }]
+        },
+        "responsibilities": [
+          "Provide the facts features are computed from.",
+          "Carry event timestamps so history can be replayed correctly.",
+          "Supply ground-truth labels, often days later (chargebacks, churn)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Upstream schema change",
+            "impact": "Feature pipelines silently compute nulls.",
+            "mitigation": "Data contracts and validation (Great Expectations) on every input."
+          },
+          {
+            "scenario": "Labels arrive late",
+            "impact": "Recent data looks like all negatives.",
+            "mitigation": "Only train on windows whose labels have matured."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pipelines",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Feature Pipelines",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Spark batch", "Flink streaming", "Feature definitions as code"],
+        "io": {
+          "input": [{ "name": "Raw data", "type": "Events + tables" }],
+          "output": [{ "name": "Feature values", "type": "(entity, feature, value, event_ts)" }]
+        },
+        "responsibilities": [
+          "Computes each feature from one shared definition.",
+          "Writes history offline and latest values online.",
+          "Backfills new features over historical data."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Batch and streaming logic diverge",
+            "impact": "Training/serving skew: the model sees different inputs in production.",
+            "mitigation": "One definition compiled to both engines; compare outputs continuously."
+          },
+          {
+            "scenario": "Streaming job lags",
+            "impact": "Online features go stale.",
+            "mitigation": "Freshness SLOs per feature with alerts; models tolerant of missing values."
+          }
+        ]
+      }
+    },
+    {
+      "id": "offline",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Offline Feature Store",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Iceberg / Delta tables", "Point-in-time joins"],
+        "io": {
+          "input": [{ "name": "History", "type": "Timestamped feature values" }],
+          "output": [{ "name": "Training set", "type": "Labels joined with features as of each label time" }]
+        },
+        "responsibilities": [
+          "Keeps full feature history for training and backtests.",
+          "Builds training sets without future leakage.",
+          "Versions datasets so any model can be reproduced."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Naive join on latest values",
+            "impact": "Leakage: brilliant offline accuracy, poor production results.",
+            "mitigation": "As-of joins on event timestamp; leakage checks in CI."
+          },
+          {
+            "scenario": "Huge scans for every experiment",
+            "impact": "Slow, expensive iteration.",
+            "mitigation": "Partitioning, caching of common training sets, sampling."
+          }
+        ]
+      }
+    },
+    {
+      "id": "online",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Online Feature Store",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Redis / DynamoDB", "Low-latency lookups"],
+        "io": {
+          "input": [{ "name": "Latest values", "type": "Upserts from pipelines" }],
+          "output": [{ "name": "Feature vector", "type": "get(user_42) → 120 features in < 5 ms" }]
+        },
+        "responsibilities": [
+          "Serves the latest feature values per entity at low latency.",
+          "Handles high read throughput from serving.",
+          "Expires values that are too stale to trust."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Online store unavailable",
+            "impact": "Predictions fail or use defaults.",
+            "mitigation": "Replicas, fallbacks to default values, and a simpler backup model."
+          },
+          {
+            "scenario": "Hot entity key",
+            "impact": "Latency spikes for one shard.",
+            "mitigation": "Replicate hot keys; cache in the serving process."
+          }
+        ]
+      }
+    },
+    {
+      "id": "training",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Training Jobs",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["PyTorch / XGBoost", "GPU cluster", "Experiment tracking"],
+        "io": {
+          "input": [{ "name": "Dataset", "type": "Versioned training set + config" }],
+          "output": [{ "name": "Model", "type": "Artifact + metrics + lineage" }]
+        },
+        "responsibilities": [
+          "Trains models reproducibly from versioned data and code.",
+          "Tunes hyperparameters and evaluates on held-out data.",
+          "Records lineage: which data and code produced this model."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Non-reproducible runs",
+            "impact": "Cannot explain or rebuild a production model.",
+            "mitigation": "Pin data snapshots, seeds, and container images."
+          },
+          {
+            "scenario": "GPU job preempted",
+            "impact": "Hours of training lost.",
+            "mitigation": "Checkpoint regularly and resume."
+          }
+        ]
+      }
+    },
+    {
+      "id": "registry",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Model Registry & Evaluation",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["MLflow registry", "Eval gates"],
+        "io": {
+          "input": [{ "name": "Candidate", "type": "Model v18 + metrics" }],
+          "output": [{ "name": "Release", "type": "Stage: staging → production (approved)" }]
+        },
+        "responsibilities": [
+          "Stores every model version with metadata.",
+          "Gates promotion on metrics, fairness, and latency tests.",
+          "Enables instant rollback to the previous version."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Offline metric improves but business metric drops",
+            "impact": "A 'better' model hurts the product.",
+            "mitigation": "Online A/B tests before full promotion."
+          },
+          {
+            "scenario": "Manual, undocumented promotions",
+            "impact": "No one knows what is in production.",
+            "mitigation": "Promotion only through the registry with approvals."
+          }
+        ]
+      }
+    },
+    {
+      "id": "serving",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Model Serving",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Triton / KServe", "Shadow & canary"],
+        "io": {
+          "input": [{ "name": "Request", "type": "Entity ID + request context" }],
+          "output": [{ "name": "Prediction", "type": "{ score: 0.87, model: v18 } + logged inputs" }]
+        },
+        "responsibilities": [
+          "Fetches online features and runs inference within the latency budget.",
+          "Runs new versions in shadow or canary before full rollout.",
+          "Logs inputs and outputs for monitoring and future training."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Data drift (inputs change after launch)",
+            "impact": "Accuracy decays silently.",
+            "mitigation": "Distribution monitoring per feature; retrain triggers."
+          },
+          {
+            "scenario": "Model and features out of sync",
+            "impact": "New model expects a feature the online store lacks.",
+            "mitigation": "Deploy feature definitions before the model that needs them; validate at load."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-sources-pipelines", "source": "sources", "sourceHandle": "r", "target": "pipelines", "targetHandle": "l", "data": { "flow": "features", "payload": "events + tables", "steps": [1] } },
+    { "id": "e-pipelines-offline", "source": "pipelines", "sourceHandle": "t", "target": "offline", "targetHandle": "l", "data": { "flow": "features", "payload": "history", "steps": [2] } },
+    { "id": "e-pipelines-online", "source": "pipelines", "sourceHandle": "b", "target": "online", "targetHandle": "l", "data": { "flow": "features", "payload": "latest values", "steps": [2] } },
+    { "id": "e-offline-training", "source": "offline", "sourceHandle": "r", "target": "training", "targetHandle": "t", "data": { "flow": "training", "payload": "point-in-time training set", "steps": [3] } },
+    { "id": "e-training-registry", "source": "training", "sourceHandle": "r", "target": "registry", "targetHandle": "l", "data": { "flow": "training", "payload": "model + metrics", "steps": [4] } },
+    { "id": "e-registry-serving", "source": "registry", "sourceHandle": "b", "target": "serving", "targetHandle": "t", "data": { "flow": "training", "payload": "promote (canary)", "steps": [5] } },
+    { "id": "e-online-serving", "source": "online", "sourceHandle": "r", "target": "serving", "targetHandle": "l", "data": { "flow": "serving", "payload": "features at request time", "steps": [6], "bidirectional": true } },
+    { "id": "e-serving-sources", "source": "serving", "sourceHandle": "b", "target": "sources", "targetHandle": "b", "data": { "flow": "serving", "payload": "predictions + outcomes → drift / retrain", "steps": [7] } }
+  ]
+}

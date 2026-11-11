@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "id": "email-delivery",
+  "title": "Email Delivery",
+  "summary": "Sending email is easy; getting it into the inbox is not. Receiving servers like Gmail judge every message by who sent it and how that sender has behaved. A delivery system authenticates mail with SPF, DKIM, and DMARC, sends from IPs and domains with a good reputation, paces traffic to each mailbox provider, and listens closely to bounces and spam complaints, removing bad addresses before they damage reputation.",
+  "flows": {
+    "send": { "label": "Sending", "color": "#38bdf8" },
+    "auth": { "label": "Authentication checks", "color": "#fbbf24" },
+    "feedback": { "label": "Feedback loop", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "App sends an email", "text": "The app calls the email API: send a password-reset template to jane@gmail.com with the message ID as an idempotency key." },
+    { "step": 2, "title": "Check suppression", "text": "The API checks a suppression list. Addresses that hard-bounced, complained, or unsubscribed are skipped. Sending to them is the fastest way to ruin reputation." },
+    { "step": 3, "title": "Sign and queue", "text": "The message is rendered, DKIM-signed with the sending domain's private key, and queued per destination domain on a mail transfer agent (MTA)." },
+    { "step": 4, "title": "Deliver over SMTP", "text": "The MTA looks up gmail.com's MX records, connects over TLS, and hands the message off, pacing connections per provider and retrying 4xx deferrals with backoff for up to days." },
+    { "step": 5, "title": "Receiver verifies the sender", "text": "Gmail checks SPF (is this IP allowed to send for the domain?), DKIM (is the signature valid?), and DMARC (do they align with the From: domain, and what is the policy if not?), all published in the sender's DNS." },
+    { "step": 6, "title": "Bounces and complaints come back", "text": "Hard bounces (no such user), soft bounces, spam complaints via feedback loops, and daily DMARC aggregate reports flow back to the sender." },
+    { "step": 7, "title": "Suppress and adjust", "text": "Bad addresses are suppressed immediately, complaint rates are watched (keep below about 0.1%), and sending is throttled if a provider starts deferring." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Application",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Transactional + marketing email"],
+        "io": {
+          "input": [{ "name": "Status", "type": "accepted, delivered, bounced, complained" }],
+          "output": [{ "name": "Send", "type": "{ to, template: reset_password, data, messageId }" }]
+        },
+        "responsibilities": [
+          "Sends only to people who expect the email.",
+          "Separates transactional mail (password reset) from marketing.",
+          "Includes one-click unsubscribe on bulk mail."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Marketing and transactional mail share a domain/IP",
+            "impact": "A spammy campaign stops password resets from arriving.",
+            "mitigation": "Separate subdomains and IP pools per mail stream."
+          },
+          {
+            "scenario": "Bought or old email lists",
+            "impact": "Spam traps hit; domain blocklisted.",
+            "mitigation": "Opt-in only; confirm sign-ups; sunset inactive addresses."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Email API",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["SES / SendGrid / Postmark-style", "Templates"],
+        "io": {
+          "input": [{ "name": "Request", "type": "POST /send" }],
+          "output": [{ "name": "Message", "type": "Rendered MIME + DKIM signature, queued" }]
+        },
+        "responsibilities": [
+          "Validates addresses and checks suppression before sending.",
+          "Renders templates and signs with DKIM.",
+          "Enforces per-account sending limits."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retry sends a duplicate email",
+            "impact": "Users get two password resets.",
+            "mitigation": "Idempotency on message ID."
+          },
+          {
+            "scenario": "Compromised customer account sends spam",
+            "impact": "Shared IPs blocklisted for everyone.",
+            "mitigation": "Content scanning, anomaly detection, automatic pausing."
+          }
+        ]
+      }
+    },
+    {
+      "id": "suppression",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Suppression List",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Key-value store", "Per-account + global"],
+        "io": {
+          "input": [{ "name": "Additions", "type": "Hard bounces, complaints, unsubscribes" }],
+          "output": [{ "name": "Lookup", "type": "jane@… suppressed? reason, since" }]
+        },
+        "responsibilities": [
+          "Blocks sends to known-bad or opted-out addresses.",
+          "Updates immediately on bounces and complaints.",
+          "Honours legal unsubscribe requirements."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Suppression check skipped on a code path",
+            "impact": "Repeated bounces damage reputation.",
+            "mitigation": "Enforce in the API layer, not in each caller."
+          },
+          {
+            "scenario": "Soft bounce wrongly suppressed forever",
+            "impact": "Valid user stops receiving mail.",
+            "mitigation": "Suppress soft bounces only after repeated failures; allow removal."
+          }
+        ]
+      }
+    },
+    {
+      "id": "mta",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "MTA Fleet",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Postfix / PowerMTA", "Queues per destination", "Warmed IP pools"],
+        "io": {
+          "input": [{ "name": "Queued mail", "type": "Messages grouped by recipient domain" }],
+          "output": [{ "name": "SMTP", "type": "MAIL FROM / RCPT TO / DATA over STARTTLS" }]
+        },
+        "responsibilities": [
+          "Delivers to each provider at a rate it accepts.",
+          "Retries temporary failures for up to ~72 hours.",
+          "Warms up new IPs gradually to build reputation."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Gmail returns 421 deferrals",
+            "impact": "Mail backs up; delays grow.",
+            "mitigation": "Back off for that domain; reduce concurrency; investigate reputation."
+          },
+          {
+            "scenario": "New IP sends full volume on day one",
+            "impact": "Throttled or blocked.",
+            "mitigation": "Gradual warm-up schedule over weeks."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dns",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Sender DNS Records",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["SPF / DKIM / DMARC TXT", "MX"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "TXT selector._domainkey.mail.acme.com" }],
+          "output": [{ "name": "Policy", "type": "v=DMARC1; p=reject; rua=mailto:dmarc@acme.com" }]
+        },
+        "responsibilities": [
+          "Publishes which servers may send for the domain (SPF).",
+          "Publishes DKIM public keys for signature checks.",
+          "Tells receivers what to do with unauthenticated mail (DMARC)."
+        ],
+        "failureModes": [
+          {
+            "scenario": "SPF exceeds the 10-lookup limit",
+            "impact": "SPF fails; mail goes to spam.",
+            "mitigation": "Flatten includes; use subdomains per sending service."
+          },
+          {
+            "scenario": "DMARC p=reject before all senders are aligned",
+            "impact": "Legitimate mail from a forgotten tool is rejected.",
+            "mitigation": "Start at p=none, read reports, then tighten."
+          }
+        ]
+      }
+    },
+    {
+      "id": "receiver",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Mailbox Providers",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Gmail / Outlook / Yahoo", "Spam filters"],
+        "io": {
+          "input": [{ "name": "Message", "type": "SMTP delivery" }],
+          "output": [{ "name": "Verdict", "type": "Inbox / spam / reject (550) / defer (421)" }]
+        },
+        "responsibilities": [
+          "Authenticate senders and score reputation and content.",
+          "Decide inbox or spam placement.",
+          "Report complaints back through feedback loops."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Missing authentication",
+            "impact": "Bulk mail rejected (required by Gmail and Yahoo since 2024).",
+            "mitigation": "SPF + DKIM + DMARC aligned, plus one-click unsubscribe."
+          },
+          {
+            "scenario": "High complaint rate",
+            "impact": "Domain reputation drops; everything lands in spam.",
+            "mitigation": "Monitor Postmaster Tools; send only wanted mail."
+          }
+        ]
+      }
+    },
+    {
+      "id": "feedback",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 240 },
+      "data": {
+        "label": "Bounces & Feedback",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Bounce parser", "FBL + DMARC reports"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "DSN bounces, ARF complaints, DMARC XML" }],
+          "output": [{ "name": "Actions", "type": "Suppress address, alert, throttle" }]
+        },
+        "responsibilities": [
+          "Classifies bounces (hard vs soft) and complaints.",
+          "Feeds the suppression list immediately.",
+          "Tracks reputation metrics per domain and IP."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bounce parsing misses new formats",
+            "impact": "Invalid addresses keep receiving mail.",
+            "mitigation": "Use standard DSN codes; review unclassified bounces."
+          },
+          {
+            "scenario": "Ignoring DMARC reports",
+            "impact": "Spoofing of your domain goes unnoticed.",
+            "mitigation": "Process aggregate reports; alert on unknown senders."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-api", "source": "app", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "send", "payload": "send(template, to)", "steps": [1] } },
+    { "id": "e-api-suppression", "source": "api", "sourceHandle": "t", "target": "suppression", "targetHandle": "l", "data": { "flow": "send", "payload": "suppressed?", "steps": [2], "bidirectional": true } },
+    { "id": "e-api-mta", "source": "api", "sourceHandle": "b", "target": "mta", "targetHandle": "l", "data": { "flow": "send", "payload": "DKIM-signed, queued", "steps": [3] } },
+    { "id": "e-mta-receiver", "source": "mta", "sourceHandle": "r", "target": "receiver", "targetHandle": "l", "data": { "flow": "send", "payload": "SMTP over TLS", "steps": [4], "bidirectional": true } },
+    { "id": "e-receiver-dns", "source": "receiver", "sourceHandle": "t", "target": "dns", "targetHandle": "b", "data": { "flow": "auth", "payload": "SPF · DKIM · DMARC", "steps": [5], "bidirectional": true } },
+    { "id": "e-receiver-feedback", "source": "receiver", "sourceHandle": "r", "target": "feedback", "targetHandle": "b", "data": { "flow": "feedback", "payload": "bounces + complaints", "steps": [6] } },
+    { "id": "e-feedback-suppression", "source": "feedback", "sourceHandle": "t", "target": "suppression", "targetHandle": "t", "data": { "flow": "feedback", "payload": "suppress bad addresses", "steps": [7] } }
+  ]
+}
