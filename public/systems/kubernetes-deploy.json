@@ -1,0 +1,254 @@
+{
+  "schemaVersion": 1,
+  "id": "kubernetes-deploy",
+  "title": "Kubernetes Deployment",
+  "summary": "Kubernetes runs on desired state. You declare what you want ('3 replicas of v2'), the API server stores it in etcd, and independent controllers each watch for differences between desired and actual state and act to close the gap. A Deployment rollout is many small loops cooperating: the Deployment controller creates pods, the scheduler places them, and kubelets run them, all coordinating through the API server.",
+  "flows": {
+    "desired": { "label": "Desired state", "color": "#a78bfa" },
+    "control": { "label": "Control loops (watch)", "color": "#38bdf8" },
+    "node": { "label": "Node execution", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Apply a Deployment", "text": "kubectl apply (or a GitOps controller) sends the Deployment manifest with the new image v2 and replicas: 3 to the API server." },
+    { "step": 2, "title": "Validate and persist", "text": "The API server authenticates the request, checks RBAC, runs admission webhooks (e.g. 'images must be signed'), and stores the object in etcd, which replicates it with Raft." },
+    { "step": 3, "title": "Controller creates a ReplicaSet", "text": "The Deployment controller, watching Deployments, sees the new template. It creates a v2 ReplicaSet and scales it up while scaling v1 down, within maxSurge and maxUnavailable." },
+    { "step": 4, "title": "Scheduler places pods", "text": "The scheduler watches for pods with no node. It filters nodes by resources, taints, and affinity, scores the rest (spread across zones, bin-packing), and binds each pod to the best node." },
+    { "step": 5, "title": "Kubelet sees its pods", "text": "The kubelet on the chosen node watches for pods bound to it and starts working on the new one." },
+    { "step": 6, "title": "Run the containers", "text": "Through the container runtime interface (CRI), the kubelet pulls the image, sets up networking and volumes, starts the containers, and begins liveness and readiness probes." },
+    { "step": 7, "title": "Ready, then continue the rollout", "text": "Once the readiness probe passes, the pod joins the Service's endpoints and receives traffic. The controller then removes one old pod, which gets SIGTERM and a grace period, and repeats." }
+  ],
+  "nodes": [
+    {
+      "id": "user",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "kubectl / GitOps",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["kubectl", "Argo CD / Flux"],
+        "io": {
+          "input": [{ "name": "Status", "type": "rollout status: 2 of 3 updated replicas available" }],
+          "output": [{ "name": "Manifest", "type": "Deployment { replicas: 3, image: app:v2, strategy }" }]
+        },
+        "responsibilities": [
+          "Declares the desired state rather than issuing step-by-step commands.",
+          "Keeps manifests in Git as the reviewed source of truth.",
+          "Watches rollout status and can undo to the previous revision."
+        ],
+        "failureModes": [
+          {
+            "scenario": "No resource requests set",
+            "impact": "Scheduler overpacks nodes; pods are OOM-killed under load.",
+            "mitigation": "Require requests and limits with admission policies."
+          },
+          {
+            "scenario": "Manual edits drift from Git",
+            "impact": "Next GitOps sync reverts a hotfix unexpectedly.",
+            "mitigation": "All changes through Git; drift detection alerts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "etcd",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "etcd",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Raft consensus", "3 or 5 members"],
+        "io": {
+          "input": [{ "name": "Writes", "type": "Objects with resourceVersion" }],
+          "output": [{ "name": "Watch stream", "type": "Ordered change events" }]
+        },
+        "responsibilities": [
+          "Stores all cluster state consistently.",
+          "Provides watch streams that controllers rely on.",
+          "Survives minority member failures."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Quorum lost",
+            "impact": "No writes: nothing can deploy or reschedule (running pods continue).",
+            "mitigation": "Odd member count across zones; regular snapshots and tested restores."
+          },
+          {
+            "scenario": "Slow disk",
+            "impact": "Leader elections and API latency spikes.",
+            "mitigation": "Dedicated SSDs; monitor fsync latency."
+          }
+        ]
+      }
+    },
+    {
+      "id": "controllers",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Controller Manager",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Deployment & ReplicaSet controllers", "Leader election"],
+        "io": {
+          "input": [{ "name": "Watch", "type": "Deployments, ReplicaSets, Pods" }],
+          "output": [{ "name": "Actions", "type": "Create RS v2, scale v2 up / v1 down" }]
+        },
+        "responsibilities": [
+          "Repeatedly compares desired with actual state and corrects any gap.",
+          "Rolls out within maxSurge / maxUnavailable limits.",
+          "Pauses a rollout that stops making progress."
+        ],
+        "failureModes": [
+          {
+            "scenario": "New pods crash-loop",
+            "impact": "Rollout stalls halfway with mixed versions.",
+            "mitigation": "progressDeadlineSeconds marks failure; CD tooling rolls back."
+          },
+          {
+            "scenario": "Controller-manager down",
+            "impact": "No reconciliation: failed pods are not replaced.",
+            "mitigation": "Multiple replicas with leader election."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 240 },
+      "data": {
+        "label": "API Server",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["kube-apiserver", "Admission webhooks"],
+        "io": {
+          "input": [{ "name": "Requests", "type": "REST + watch from users, controllers, kubelets" }],
+          "output": [{ "name": "State", "type": "Persisted objects + watch events to subscribers" }]
+        },
+        "responsibilities": [
+          "Is the only component that talks to etcd; everyone else uses it.",
+          "Authenticates, authorises (RBAC), and validates every change.",
+          "Fans out watch events so controllers react without polling."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Admission webhook down with failurePolicy: Fail",
+            "impact": "All pod creations rejected; cluster cannot heal.",
+            "mitigation": "Highly available webhooks, timeouts, and exemptions for system namespaces."
+          },
+          {
+            "scenario": "Too many LIST calls from a misbehaving client",
+            "impact": "API server overloaded for everyone.",
+            "mitigation": "API priority and fairness; informers with caches instead of polling."
+          }
+        ]
+      }
+    },
+    {
+      "id": "scheduler",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Scheduler",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Filter → score → bind", "Topology spread"],
+        "io": {
+          "input": [{ "name": "Pending pods", "type": "Pods with no nodeName" }],
+          "output": [{ "name": "Binding", "type": "pod app-v2-x7k → node-14" }]
+        },
+        "responsibilities": [
+          "Finds nodes with enough CPU and memory that satisfy constraints.",
+          "Spreads replicas across zones and nodes for resilience.",
+          "Leaves pods Pending with a reason if nothing fits."
+        ],
+        "failureModes": [
+          {
+            "scenario": "No node has room",
+            "impact": "Pods stay Pending; rollout stalls.",
+            "mitigation": "Cluster autoscaler adds nodes; priority classes evict less important work."
+          },
+          {
+            "scenario": "All replicas land in one zone",
+            "impact": "One zone outage takes the service down.",
+            "mitigation": "Topology spread constraints and pod anti-affinity."
+          }
+        ]
+      }
+    },
+    {
+      "id": "kubelet",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Kubelet (per node)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Node agent", "Probes"],
+        "io": {
+          "input": [{ "name": "Pod specs", "type": "Pods bound to this node" }],
+          "output": [{ "name": "Pod status", "type": "Running, Ready=true, restarts, events" }]
+        },
+        "responsibilities": [
+          "Makes the node's actual pods match the pods assigned to it.",
+          "Runs liveness and readiness probes and restarts failed containers.",
+          "Handles graceful termination on scale-down."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Node becomes unreachable",
+            "impact": "Its pods are marked lost after a timeout.",
+            "mitigation": "Controllers recreate pods elsewhere; PodDisruptionBudgets for planned drains."
+          },
+          {
+            "scenario": "App ignores SIGTERM",
+            "impact": "In-flight requests are cut off during rollouts.",
+            "mitigation": "Handle SIGTERM, preStop hooks, and an adequate grace period."
+          }
+        ]
+      }
+    },
+    {
+      "id": "runtime",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Container Runtime & Pods",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["containerd (CRI)", "CNI networking"],
+        "io": {
+          "input": [{ "name": "CRI calls", "type": "PullImage, RunPodSandbox, CreateContainer" }],
+          "output": [{ "name": "Running pod", "type": "Containers with an IP, serving traffic" }]
+        },
+        "responsibilities": [
+          "Pulls images and starts isolated containers.",
+          "Sets up the pod network and mounts volumes.",
+          "Enforces CPU and memory limits with cgroups."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Image pull fails (bad tag, registry down)",
+            "impact": "ImagePullBackOff; rollout stuck.",
+            "mitigation": "Deploy by digest from a verified registry; pre-pull for large images."
+          },
+          {
+            "scenario": "Memory limit too low",
+            "impact": "OOMKilled restarts under real load.",
+            "mitigation": "Set limits from observed usage; alert on OOM kills."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-user-api", "source": "user", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "desired", "payload": "apply Deployment", "steps": [1], "bidirectional": true } },
+    { "id": "e-api-etcd", "source": "api", "sourceHandle": "t", "target": "etcd", "targetHandle": "r", "data": { "flow": "desired", "payload": "persist (Raft)", "steps": [2], "bidirectional": true } },
+    { "id": "e-api-controllers", "source": "api", "sourceHandle": "b", "target": "controllers", "targetHandle": "r", "data": { "flow": "control", "payload": "watch → ReplicaSets", "steps": [3, 7], "bidirectional": true } },
+    { "id": "e-api-scheduler", "source": "api", "sourceHandle": "t", "target": "scheduler", "targetHandle": "l", "data": { "flow": "control", "payload": "pending pod → bind", "steps": [4], "bidirectional": true } },
+    { "id": "e-api-kubelet", "source": "api", "sourceHandle": "b", "target": "kubelet", "targetHandle": "l", "data": { "flow": "control", "payload": "my pods ⇄ status", "steps": [5, 7], "bidirectional": true } },
+    { "id": "e-kubelet-runtime", "source": "kubelet", "sourceHandle": "r", "target": "runtime", "targetHandle": "l", "data": { "flow": "node", "payload": "CRI: pull + start", "steps": [6] } }
+  ]
+}

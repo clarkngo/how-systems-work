@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "id": "flash-sale",
+  "title": "Flash Sale / Ticketing",
+  "summary": "A flash sale sends a million people at 10,000 items in the same second. The system cannot serve everyone at once, and it must never sell item 10,001. So it protects itself in layers. A CDN absorbs page loads and bots, a virtual waiting room admits buyers at a rate the backend can handle, and stock is decremented atomically so each unit is held by exactly one buyer until they pay or the hold expires.",
+  "flows": {
+    "traffic": { "label": "User traffic", "color": "#38bdf8" },
+    "admission": { "label": "Admission control", "color": "#fbbf24" },
+    "reservation": { "label": "Reservation & order", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Crowd arrives", "text": "At 10:00:00 a million users load the sale page. It is static and served from CDN cache, while bot detection and per-IP limits drop scripted traffic at the edge." },
+    { "step": 2, "title": "Join the waiting room", "text": "Users get a queue position. Randomising positions among those who arrived before the start removes the advantage of refreshing fastest." },
+    { "step": 3, "title": "Admit at a safe rate", "text": "The waiting room lets in, say, 2,000 users per second, a rate the backend was load-tested for, and gives each one a signed, short-lived admission token." },
+    { "step": 4, "title": "Request a reservation", "text": "The admitted user clicks Buy. The reservation service rejects any request without a valid token, so skipping the queue does not work." },
+    { "step": 5, "title": "Atomically take one unit", "text": "A Lua script in Redis checks stock > 0 and decrements it in one atomic step. Two buyers can never both get the last unit, and the database is not involved yet." },
+    { "step": 6, "title": "Hold and pay", "text": "A hold with a 10-minute expiry is written and an order is queued. The user pays within the hold window, and the order is confirmed asynchronously." },
+    { "step": 7, "title": "Release expired holds", "text": "Unpaid holds expire and their units go back into stock, so the next people admitted from the queue can buy them." }
+  ],
+  "nodes": [
+    {
+      "id": "users",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Buyers",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Web / mobile", "Countdown page"],
+        "io": {
+          "input": [{ "name": "Status", "type": "Queue position → admitted → reserved → paid" }],
+          "output": [{ "name": "Actions", "type": "Load page · join queue · reserve · pay" }]
+        },
+        "responsibilities": [
+          "Load the event page and wait in line.",
+          "Complete payment before the hold expires.",
+          "Keep the queue tab open; no refreshing needed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Users refresh frantically",
+            "impact": "Load multiplies; users lose their place.",
+            "mitigation": "Queue position bound to a cookie and token; refresh resumes the same spot."
+          },
+          {
+            "scenario": "Scalper bots",
+            "impact": "Real fans get nothing.",
+            "mitigation": "Bot scoring, verified accounts, purchase limits per account and card."
+          }
+        ]
+      }
+    },
+    {
+      "id": "edge",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "CDN & Bot Defence",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["CDN cache", "WAF + bot management"],
+        "io": {
+          "input": [{ "name": "Requests", "type": "Millions of page loads and API calls per second" }],
+          "output": [{ "name": "Filtered", "type": "Cached pages served; legitimate API calls passed through" }]
+        },
+        "responsibilities": [
+          "Serves the sale page and assets from cache so origins see none of it.",
+          "Blocks bots and enforces per-IP and per-account rate limits.",
+          "Routes queue and reservation calls to the right services."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Page not cacheable (personalised header)",
+            "impact": "The origin is hit with millions of page loads.",
+            "mitigation": "Fully static page; personal data fetched by a small API call later."
+          },
+          {
+            "scenario": "Bots solve challenges at scale",
+            "impact": "Queue filled with bots.",
+            "mitigation": "Layered signals (device, behaviour, account age), not CAPTCHA alone."
+          }
+        ]
+      }
+    },
+    {
+      "id": "waiting",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Virtual Waiting Room",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Queue-it-style service", "Signed tokens (JWT)"],
+        "io": {
+          "input": [{ "name": "Join", "type": "{ eventId, sessionId }" }],
+          "output": [{ "name": "Admission", "type": "Position, then token { eventId, user, exp: 10 min }" }]
+        },
+        "responsibilities": [
+          "Turns a spike into a steady flow the backend can handle.",
+          "Admits users in order at a configurable rate.",
+          "Issues tokens that are verified without a database lookup."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Admission rate set too high",
+            "impact": "Backend overloads and everyone gets errors.",
+            "mitigation": "Set from load tests; adjust automatically on backend latency."
+          },
+          {
+            "scenario": "Admission token shared or replayed",
+            "impact": "Bots reuse one admission.",
+            "mitigation": "Bind the token to session and account; single-use for reserve."
+          }
+        ]
+      }
+    },
+    {
+      "id": "reserve",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Reservation Service",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Stateless, autoscaled", "Idempotency keys"],
+        "io": {
+          "input": [{ "name": "Reserve", "type": "POST /reserve { sku, qty: 1 } + admission token" }],
+          "output": [{ "name": "Hold", "type": "{ holdId, expiresAt } or SOLD_OUT" }]
+        },
+        "responsibilities": [
+          "Validates admission token, purchase limits, and idempotency.",
+          "Decrements stock atomically before anything slower happens.",
+          "Answers 'sold out' instantly once stock hits zero."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Read stock, then write (two steps)",
+            "impact": "Race between buyers, so the item is oversold.",
+            "mitigation": "Single atomic operation (Lua / DECR with check, or a conditional DB update)."
+          },
+          {
+            "scenario": "Client retries a reserve that succeeded",
+            "impact": "Two units held for one buyer.",
+            "mitigation": "Idempotency key per user and SKU."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stock",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Stock Counter",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Redis + Lua", "Sharded per SKU"],
+        "io": {
+          "input": [{ "name": "Take", "type": "EVAL take.lua stock:{sku} 1" }],
+          "output": [{ "name": "Result", "type": "remaining or -1 (sold out)" }]
+        },
+        "responsibilities": [
+          "Holds available units in memory for fast atomic decrements.",
+          "Is loaded from the database before the sale starts.",
+          "Gets units back when holds expire or orders are cancelled."
+        ],
+        "failureModes": [
+          {
+            "scenario": "One SKU key is the hottest key in the system",
+            "impact": "A single Redis node bottlenecks.",
+            "mitigation": "Split stock into N sub-counters across shards; try another when one hits zero."
+          },
+          {
+            "scenario": "Redis failover loses recent decrements",
+            "impact": "Counter is higher than reality, so units are oversold.",
+            "mitigation": "Reconcile against durable holds before confirming; keep a small unsold buffer."
+          }
+        ]
+      }
+    },
+    {
+      "id": "orders",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Holds & Order Queue",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Holds table with TTL", "Kafka order queue"],
+        "io": {
+          "input": [{ "name": "Hold", "type": "{ holdId, user, sku, expiresAt }" }],
+          "output": [{ "name": "Order", "type": "Order created once payment succeeds; expiries release stock" }]
+        },
+        "responsibilities": [
+          "Records each hold durably, the real source of truth for who got a unit.",
+          "Queues order creation so the database writes at a steady pace.",
+          "Expires unpaid holds and returns their units."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Expiry job falls behind",
+            "impact": "Units stuck in dead holds; the event shows sold out too early.",
+            "mitigation": "Expiry by timestamp checked on read, plus a frequent sweeper."
+          },
+          {
+            "scenario": "Payment completes just after the hold expired",
+            "impact": "Charged but the unit was released to someone else.",
+            "mitigation": "Grace period, and a conditional confirm that refunds if the hold is gone."
+          }
+        ]
+      }
+    },
+    {
+      "id": "payments",
+      "type": "systemNode",
+      "position": { "x": 1900, "y": 240 },
+      "data": {
+        "label": "Payment Provider",
+        "layer": "external",
+        "criticality": "degradable",
+        "tech": ["Card / wallet checkout", "Webhooks"],
+        "io": {
+          "input": [{ "name": "Charge", "type": "Amount + holdId as idempotency key" }],
+          "output": [{ "name": "Result", "type": "payment.succeeded / failed webhook" }]
+        },
+        "responsibilities": [
+          "Charges the buyer during the hold window.",
+          "Reports results asynchronously by webhook.",
+          "Absorbs payment spikes within its own rate limits."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Provider rate-limits the burst",
+            "impact": "Payments fail and holds expire unpaid.",
+            "mitigation": "Pre-arranged capacity with the provider; pace admissions to payment throughput too."
+          },
+          {
+            "scenario": "Webhook delayed",
+            "impact": "Order not confirmed though the user paid.",
+            "mitigation": "Poll the payment status before expiring a hold that has a payment attempt."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-users-edge", "source": "users", "sourceHandle": "r", "target": "edge", "targetHandle": "l", "data": { "flow": "traffic", "payload": "page · queue · reserve", "steps": [1, 4], "bidirectional": true } },
+    { "id": "e-edge-waiting", "source": "edge", "sourceHandle": "t", "target": "waiting", "targetHandle": "l", "data": { "flow": "admission", "payload": "join → position", "steps": [2], "bidirectional": true } },
+    { "id": "e-waiting-reserve", "source": "waiting", "sourceHandle": "r", "target": "reserve", "targetHandle": "t", "data": { "flow": "admission", "payload": "admit N/s · signed token", "steps": [3] } },
+    { "id": "e-edge-reserve", "source": "edge", "sourceHandle": "r", "target": "reserve", "targetHandle": "l", "data": { "flow": "traffic", "payload": "reserve + token", "steps": [4], "bidirectional": true } },
+    { "id": "e-reserve-stock", "source": "reserve", "sourceHandle": "r", "target": "stock", "targetHandle": "l", "data": { "flow": "reservation", "payload": "atomic take 1", "steps": [5], "bidirectional": true } },
+    { "id": "e-reserve-orders", "source": "reserve", "sourceHandle": "b", "target": "orders", "targetHandle": "l", "data": { "flow": "reservation", "payload": "hold (10 min)", "steps": [6] } },
+    { "id": "e-orders-payments", "source": "orders", "sourceHandle": "r", "target": "payments", "targetHandle": "b", "data": { "flow": "reservation", "payload": "charge ⇄ webhook", "steps": [6], "bidirectional": true } },
+    { "id": "e-orders-stock", "source": "orders", "sourceHandle": "t", "target": "stock", "targetHandle": "b", "data": { "flow": "reservation", "payload": "release expired holds", "steps": [7] } }
+  ]
+}

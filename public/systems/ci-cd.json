@@ -1,0 +1,254 @@
+{
+  "schemaVersion": 1,
+  "id": "ci-cd",
+  "title": "CI/CD Pipeline",
+  "summary": "A CI/CD pipeline turns a code change into running production software safely and repeatably. Continuous integration builds and tests every change in parallel and produces one immutable, signed artifact. Continuous delivery then promotes that same artifact through environments and rolls it out progressively, watching real metrics, so a bad change reaches 1% of users and is rolled back automatically instead of breaking everyone.",
+  "flows": {
+    "integration": { "label": "Continuous integration", "color": "#38bdf8" },
+    "artifact": { "label": "Artifact", "color": "#a78bfa" },
+    "delivery": { "label": "Progressive delivery", "color": "#34d399" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Open a pull request", "text": "A developer pushes a branch and opens a PR. Required status checks must pass before it can merge." },
+    { "step": 2, "title": "Build and test in parallel", "text": "A webhook starts the pipeline. Runners restore dependency caches, build only what changed, and split the test suite across 40 shards, so the result comes back in minutes rather than an hour." },
+    { "step": 3, "title": "Publish one immutable artifact", "text": "After merge, CI builds the container image once, tags it with the commit SHA, attaches an SBOM and a signature, and pushes it to the registry. Every environment deploys these exact bytes." },
+    { "step": 4, "title": "CD picks up the new version", "text": "The deployment controller sees the new image digest (GitOps: a bot updates the environment's manifest repo) and starts a rollout to staging, then production." },
+    { "step": 5, "title": "Canary with automated analysis", "text": "The new version gets 1% of traffic. The controller compares its error rate and latency with the old version for 10 minutes using statistical checks." },
+    { "step": 6, "title": "Promote progressively", "text": "If metrics look healthy, traffic steps up to 10%, 50%, then 100% with a check at each stage, region by region." },
+    { "step": 7, "title": "Roll back automatically", "text": "If the canary breaches its thresholds, traffic shifts back to the old version within seconds and the team is notified, with no human decision needed in the middle of the night." }
+  ],
+  "nodes": [
+    {
+      "id": "dev",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Developer",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["git", "Pull requests"],
+        "io": {
+          "input": [{ "name": "Feedback", "type": "Check results, review comments, deploy status" }],
+          "output": [{ "name": "Change", "type": "git push → PR #812 (small, reviewed diff)" }]
+        },
+        "responsibilities": [
+          "Ships small changes often, each behind review and tests.",
+          "Puts unfinished features behind flags rather than long-lived branches.",
+          "Owns the change through to production."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Huge batched releases",
+            "impact": "Hard to find which change broke production.",
+            "mitigation": "Small PRs, trunk-based development, deploy per merge."
+          },
+          {
+            "scenario": "Flaky tests retried until green",
+            "impact": "Real bugs slip through; trust in CI erodes.",
+            "mitigation": "Quarantine and track flaky tests; fix or delete them."
+          }
+        ]
+      }
+    },
+    {
+      "id": "git",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Git Host",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["GitHub / GitLab", "Branch protection"],
+        "io": {
+          "input": [{ "name": "Push / merge", "type": "Commits, PRs, approvals" }],
+          "output": [{ "name": "Events", "type": "Webhooks: pull_request, push to main" }]
+        },
+        "responsibilities": [
+          "Stores code history and enforces required reviews and checks.",
+          "Triggers pipelines through webhooks.",
+          "Records who changed what for audit."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Direct pushes to main bypass checks",
+            "impact": "Untested code deploys.",
+            "mitigation": "Branch protection with required checks for everyone, admins included."
+          },
+          {
+            "scenario": "Webhook delivery fails",
+            "impact": "Pipeline never starts; merges look stuck.",
+            "mitigation": "Webhook redelivery and a polling fallback in CI."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ci",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "CI Runners",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Ephemeral runners", "Remote build cache (Bazel)", "Test sharding"],
+        "io": {
+          "input": [{ "name": "Job", "type": "Commit SHA + pipeline definition" }],
+          "output": [{ "name": "Results", "type": "Pass/fail per check; built image" }]
+        },
+        "responsibilities": [
+          "Builds and tests every change in clean, disposable environments.",
+          "Uses caches and sharding to keep feedback under ~10 minutes.",
+          "Runs lint, unit, integration, and security scans."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Compromised build dependency",
+            "impact": "Malicious code in the artifact (supply-chain attack).",
+            "mitigation": "Pinned and verified dependencies, isolated runners, SLSA provenance."
+          },
+          {
+            "scenario": "Slow pipeline",
+            "impact": "Developers batch changes and stop waiting for CI.",
+            "mitigation": "Build only what changed, cache aggressively, track pipeline duration as a metric."
+          }
+        ]
+      }
+    },
+    {
+      "id": "registry",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Artifact Registry",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["OCI registry", "Sigstore signatures"],
+        "io": {
+          "input": [{ "name": "Push", "type": "image@sha256:9f2c… + SBOM + signature" }],
+          "output": [{ "name": "Pull", "type": "Verified, immutable image by digest" }]
+        },
+        "responsibilities": [
+          "Stores build outputs immutably: a tag cannot be overwritten.",
+          "Lets clusters verify signatures before running anything.",
+          "Keeps old versions available for instant rollback."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Mutable 'latest' tag deployed",
+            "impact": "Environments run different code under the same name.",
+            "mitigation": "Deploy by digest; admission policy rejects unsigned or tag-only images."
+          },
+          {
+            "scenario": "Registry outage",
+            "impact": "New pods cannot pull images; scale-ups fail.",
+            "mitigation": "Regional mirrors and pull-through caches."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cd",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "CD Controller",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Argo CD / Spinnaker", "Argo Rollouts"],
+        "io": {
+          "input": [{ "name": "Desired version", "type": "Manifest: image digest for each environment" }],
+          "output": [{ "name": "Rollout", "type": "Staged traffic shifts with analysis gates" }]
+        },
+        "responsibilities": [
+          "Keeps each environment in sync with its declared version (GitOps).",
+          "Orchestrates canary steps and analysis.",
+          "Rolls back to the previous version automatically on failure."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Database migration not backward compatible",
+            "impact": "Rollback of code is impossible; old version breaks.",
+            "mitigation": "Expand-and-contract migrations decoupled from code deploys."
+          },
+          {
+            "scenario": "Config drift from manual kubectl edits",
+            "impact": "The environment differs from what Git says.",
+            "mitigation": "Controller reverts drift automatically and alerts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "canary",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Canary Analysis",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Traffic splitting (mesh / LB)", "Metric comparison (Kayenta)"],
+        "io": {
+          "input": [{ "name": "Metrics", "type": "Canary vs baseline: errors, latency, saturation" }],
+          "output": [{ "name": "Verdict", "type": "promote / hold / roll back" }]
+        },
+        "responsibilities": [
+          "Sends a small slice of traffic to the new version.",
+          "Compares it statistically with the current version.",
+          "Fails fast on clear regressions."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Too little canary traffic to detect anything",
+            "impact": "Bad versions pass analysis.",
+            "mitigation": "Minimum sample sizes; longer bake at low traffic hours."
+          },
+          {
+            "scenario": "Bug only appears at full scale",
+            "impact": "Canary passes; full rollout fails.",
+            "mitigation": "Staged percentages with analysis at each step; region-by-region rollout."
+          }
+        ]
+      }
+    },
+    {
+      "id": "prod",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Production Fleet",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Kubernetes clusters", "Multiple regions"],
+        "io": {
+          "input": [{ "name": "Rollout", "type": "New pods with v2, old pods drained" }],
+          "output": [{ "name": "Signals", "type": "Health, SLO metrics, error logs" }]
+        },
+        "responsibilities": [
+          "Runs both versions side by side during a rollout.",
+          "Reports health that drives promotion decisions.",
+          "Serves users without interruption throughout."
+        ],
+        "failureModes": [
+          {
+            "scenario": "All regions deployed at once",
+            "impact": "A bad change takes down every region together.",
+            "mitigation": "Deploy one region (or cell) at a time with bake time between."
+          },
+          {
+            "scenario": "Readiness probe too shallow",
+            "impact": "Broken pods receive traffic.",
+            "mitigation": "Readiness checks critical dependencies; canary analysis catches the rest."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-dev-git", "source": "dev", "sourceHandle": "r", "target": "git", "targetHandle": "l", "data": { "flow": "integration", "payload": "push / PR ⇄ checks", "steps": [1], "bidirectional": true } },
+    { "id": "e-git-ci", "source": "git", "sourceHandle": "t", "target": "ci", "targetHandle": "l", "data": { "flow": "integration", "payload": "webhook → pipeline", "steps": [2], "bidirectional": true } },
+    { "id": "e-ci-registry", "source": "ci", "sourceHandle": "b", "target": "registry", "targetHandle": "t", "data": { "flow": "artifact", "payload": "signed image by SHA", "steps": [3] } },
+    { "id": "e-registry-cd", "source": "registry", "sourceHandle": "r", "target": "cd", "targetHandle": "b", "data": { "flow": "artifact", "payload": "new digest", "steps": [4] } },
+    { "id": "e-cd-canary", "source": "cd", "sourceHandle": "r", "target": "canary", "targetHandle": "l", "data": { "flow": "delivery", "payload": "1% → analyse → promote / roll back", "steps": [5, 7], "bidirectional": true } },
+    { "id": "e-canary-prod", "source": "canary", "sourceHandle": "b", "target": "prod", "targetHandle": "t", "data": { "flow": "delivery", "payload": "10% → 50% → 100%", "steps": [6, 7], "bidirectional": true } }
+  ]
+}

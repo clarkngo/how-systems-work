@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "id": "content-moderation",
+  "title": "Content Moderation Pipeline",
+  "summary": "A moderation pipeline screens a huge volume of uploads against a platform's rules. Known illegal material is caught by matching hashes against shared databases, and ML classifiers score everything else for policy categories. Clear cases are actioned automatically, uncertain ones go to trained human reviewers prioritised by severity and reach. Every decision can be appealed, and outcomes become training labels.",
+  "flows": {
+    "screening": { "label": "Automated screening", "color": "#38bdf8" },
+    "review": { "label": "Human review", "color": "#fbbf24" },
+    "enforcement": { "label": "Enforcement & learning", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Content is uploaded", "text": "A user posts an image with a caption. It is stored and queued for screening; high-risk surfaces like live video and new accounts are screened before the post goes public." },
+    { "step": 2, "title": "Match known-bad hashes", "text": "A perceptual hash (PDQ, PhotoDNA) is compared against industry databases of known child-abuse and terrorist content. Perceptual hashes survive resizing and re-encoding, unlike exact checksums." },
+    { "step": 3, "title": "Score with classifiers", "text": "Image, text, and video models score each policy category: nudity, violence, hate speech, spam, self-harm. Each score is a probability, not a verdict." },
+    { "step": 4, "title": "Decide automatically", "text": "The policy engine applies per-category thresholds. A hash match or very high score means remove; very low means allow; borderline cases may be shown with reduced distribution while they wait." },
+    { "step": 5, "title": "Queue for human review", "text": "Uncertain items join review queues ordered by severity times expected views, so a borderline post going viral is seen before an obscure one." },
+    { "step": 6, "title": "Enforce and notify", "text": "The verdict is applied: remove, age-gate, label, or strike the account. The user is told which rule was broken and how to appeal." },
+    { "step": 7, "title": "Appeals and retraining", "text": "Appeals go to a different reviewer. Overturned decisions and fresh reviewer labels feed back into classifier training and threshold tuning." }
+  ],
+  "nodes": [
+    {
+      "id": "uploads",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "User Uploads",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Posts, comments, images, video, live"],
+        "io": {
+          "input": [{ "name": "Outcome", "type": "Published, limited, removed + reason" }],
+          "output": [{ "name": "Content", "type": "{ contentId, media, text, authorId, surface }" }]
+        },
+        "responsibilities": [
+          "Submit content along with context: surface, audience, author history.",
+          "Let users report content, which is an extra signal.",
+          "Show users clear notices and appeal options."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Adversarial edits (text in images, leetspeak)",
+            "impact": "Classifiers are evaded.",
+            "mitigation": "OCR and multimodal models; regular red-teaming against new evasion tricks."
+          },
+          {
+            "scenario": "Mass-report brigading",
+            "impact": "Legitimate content taken down.",
+            "mitigation": "Weight reports by reporter reliability; reports prioritise review but never decide alone."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ingest",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Moderation Orchestrator",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Queue per surface", "Pre- and post-publish modes"],
+        "io": {
+          "input": [{ "name": "Content", "type": "New and edited content + reports" }],
+          "output": [{ "name": "Signals", "type": "Hash matches + classifier scores bundled for decision" }]
+        },
+        "responsibilities": [
+          "Fans each item out to the hash and classifier services in parallel.",
+          "Chooses blocking (pre-publish) or async screening by risk.",
+          "Re-screens content when models or policies change."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Screening backlog during a viral event",
+            "impact": "Harmful content stays up for hours.",
+            "mitigation": "Prioritise by reach; autoscale; temporarily tighten thresholds on hot topics."
+          },
+          {
+            "scenario": "Classifier service down",
+            "impact": "Either nothing posts, or nothing is screened.",
+            "mitigation": "Per-surface fail mode: hold live video, publish text and re-screen later."
+          }
+        ]
+      }
+    },
+    {
+      "id": "hashes",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Hash Matching",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["PDQ / PhotoDNA / TMK", "Industry hash-sharing DBs"],
+        "io": {
+          "input": [{ "name": "Media", "type": "Image / video frames" }],
+          "output": [{ "name": "Match", "type": "{ matched: true, bank: CSAM, distance: 12 }" }]
+        },
+        "responsibilities": [
+          "Detects re-uploads of known violating media with near-zero false positives.",
+          "Shares new hashes with other platforms through industry programmes.",
+          "Handles legally required reporting (e.g. to NCMEC) for matched content."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Heavily edited copy (crop, mirror, overlay)",
+            "impact": "Hash distance too large to match.",
+            "mitigation": "Multiple hash types, matching on video segments, and classifier backup."
+          },
+          {
+            "scenario": "Bad hash added to a bank",
+            "impact": "Innocent content auto-removed at scale.",
+            "mitigation": "Review before banking and monitoring of appeal overturns per hash."
+          }
+        ]
+      }
+    },
+    {
+      "id": "classifiers",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "ML Classifiers",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Multimodal models", "Per-policy heads", "LLM policy reasoning"],
+        "io": {
+          "input": [{ "name": "Content + context", "type": "Media, text, OCR, author signals" }],
+          "output": [{ "name": "Scores", "type": "{ nudity: 0.03, violence: 0.71, hate: 0.12, … }" }]
+        },
+        "responsibilities": [
+          "Scores new, unseen content for each policy category.",
+          "Supports many languages and regions, with cultural context.",
+          "Is retrained regularly on reviewer labels and appeal outcomes."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Bias against dialects or communities",
+            "impact": "Some groups are over-enforced.",
+            "mitigation": "Fairness evaluation per language and group; calibrated thresholds; diverse labellers."
+          },
+          {
+            "scenario": "Context missing (news vs glorification)",
+            "impact": "Journalism removed, or propaganda allowed.",
+            "mitigation": "Route context-dependent categories to humans rather than auto-action."
+          }
+        ]
+      }
+    },
+    {
+      "id": "decision",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Policy Decision Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Thresholds per policy × surface", "Rules"],
+        "io": {
+          "input": [{ "name": "Signals", "type": "Hash matches, scores, reports, author history" }],
+          "output": [{ "name": "Decision", "type": "auto-remove · allow · limit + review" }]
+        },
+        "responsibilities": [
+          "Turns scores into actions using thresholds set by policy teams.",
+          "Sends uncertain or high-impact cases to humans.",
+          "Logs the reason behind every automated action."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Threshold set too aggressively",
+            "impact": "Mass false removals and a public backlash.",
+            "mitigation": "Shadow-test thresholds; watch appeal overturn rates per category."
+          },
+          {
+            "scenario": "Too much sent to humans",
+            "impact": "Queues explode and SLAs are missed.",
+            "mitigation": "Capacity-aware thresholds and severity-based triage."
+          }
+        ]
+      }
+    },
+    {
+      "id": "review",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Human Review Queues",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Review tool", "Specialist queues"],
+        "io": {
+          "input": [{ "name": "Case", "type": "Content + context + model hints, priority score" }],
+          "output": [{ "name": "Verdict", "type": "{ policy: violence, action: remove, notes }" }]
+        },
+        "responsibilities": [
+          "Trained reviewers judge nuanced cases against detailed guidelines.",
+          "Routes cases by language, region, and specialism (e.g. child safety).",
+          "Measures reviewer accuracy with audited golden sets."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Reviewer psychological harm",
+            "impact": "Burnout and trauma; worse decisions.",
+            "mitigation": "Blurring and greyscale by default, exposure limits, wellness support."
+          },
+          {
+            "scenario": "Inconsistent decisions between reviewers",
+            "impact": "Users see arbitrary enforcement.",
+            "mitigation": "Clear guidelines, calibration sessions, and double review for high impact."
+          }
+        ]
+      }
+    },
+    {
+      "id": "enforcement",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Enforcement & Appeals",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Strike system", "Appeals workflow"],
+        "io": {
+          "input": [{ "name": "Decisions", "type": "Automated and human verdicts" }],
+          "output": [{ "name": "Effects", "type": "Takedown, strikes, notices; labels for training" }]
+        },
+        "responsibilities": [
+          "Applies actions and tracks account strikes over time.",
+          "Notifies users with the specific rule and an appeal path.",
+          "Feeds appeal outcomes and labels back to model training."
+        ],
+        "failureModes": [
+          {
+            "scenario": "No meaningful appeal",
+            "impact": "Mistakes stand and users lose trust; may break laws such as the EU DSA.",
+            "mitigation": "Appeals reviewed by a different person; transparency reports."
+          },
+          {
+            "scenario": "Repeat offender evades a ban",
+            "impact": "New accounts reupload the same content.",
+            "mitigation": "Ban-evasion signals (device, payment, network) and hash-banking removed media."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-uploads-ingest", "source": "uploads", "sourceHandle": "r", "target": "ingest", "targetHandle": "l", "data": { "flow": "screening", "payload": "new content + reports", "steps": [1] } },
+    { "id": "e-ingest-hashes", "source": "ingest", "sourceHandle": "t", "target": "hashes", "targetHandle": "l", "data": { "flow": "screening", "payload": "perceptual hash match", "steps": [2], "bidirectional": true } },
+    { "id": "e-ingest-classifiers", "source": "ingest", "sourceHandle": "b", "target": "classifiers", "targetHandle": "l", "data": { "flow": "screening", "payload": "policy scores", "steps": [3], "bidirectional": true } },
+    { "id": "e-ingest-decision", "source": "ingest", "sourceHandle": "r", "target": "decision", "targetHandle": "l", "data": { "flow": "screening", "payload": "signals", "steps": [4] } },
+    { "id": "e-decision-review", "source": "decision", "sourceHandle": "r", "target": "review", "targetHandle": "l", "data": { "flow": "review", "payload": "uncertain → priority queue", "steps": [5] } },
+    { "id": "e-decision-enforcement", "source": "decision", "sourceHandle": "r", "target": "enforcement", "targetHandle": "l", "data": { "flow": "enforcement", "payload": "auto-action", "steps": [4, 6] } },
+    { "id": "e-review-enforcement", "source": "review", "sourceHandle": "b", "target": "enforcement", "targetHandle": "t", "data": { "flow": "review", "payload": "human verdict", "steps": [6, 7], "bidirectional": true } },
+    { "id": "e-enforcement-classifiers", "source": "enforcement", "sourceHandle": "b", "target": "classifiers", "targetHandle": "b", "data": { "flow": "enforcement", "payload": "labels + overturns → retrain", "steps": [7] } }
+  ]
+}

@@ -1,0 +1,226 @@
+{
+  "schemaVersion": 1,
+  "id": "distributed-cache",
+  "title": "Distributed Cache",
+  "summary": "A distributed cache keeps hot data in memory across many servers, so most reads skip the database entirely. Keys are spread over shards with consistent hashing, so adding a node moves only a small share of keys. The hard parts are not the hits but the edges: keeping the cache from serving stale data after writes, and stopping thousands of simultaneous misses from stampeding the database.",
+  "flows": {
+    "read": { "label": "Read path (cache-aside)", "color": "#38bdf8" },
+    "write": { "label": "Write & invalidation", "color": "#f472b6" },
+    "replication": { "label": "Replication", "color": "#a78bfa", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "App asks for a key", "text": "A product page needs user:42:profile. The app calls its data-access layer, which checks the cache before anything else." },
+    { "step": 2, "title": "Hash to a shard", "text": "The client hashes the key onto a consistent-hash ring and sends GET to the shard that owns it. A hit returns in well under a millisecond." },
+    { "step": 3, "title": "Miss: read the database", "text": "On a miss the data-access layer reads from the database. Only one caller per key does this: the cache hands out a short lease so others wait for the result instead of all hitting the database." },
+    { "step": 4, "title": "Populate with a TTL", "text": "The value is written back with a TTL plus a little random jitter, so keys cached at the same moment do not all expire together." },
+    { "step": 5, "title": "Write to the database", "text": "When the profile changes, the app writes to the database, the source of truth. It does not update the cache directly, which avoids races between concurrent writers." },
+    { "step": 6, "title": "Capture the change", "text": "A change-data-capture pipeline reads the database's commit log and turns each committed row change into an invalidation event." },
+    { "step": 7, "title": "Delete the cached key", "text": "The invalidation service deletes the key from the owning shard. The next read misses and fetches the fresh value." },
+    { "step": 8, "title": "Replicate for failover", "text": "Each primary shard streams changes to a replica. If the primary dies, the replica is promoted so the cache does not go cold all at once." }
+  ],
+  "nodes": [
+    {
+      "id": "app",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Application Servers",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Web / API services", "In-process L1 cache"],
+        "io": {
+          "input": [{ "name": "User request", "type": "GET /users/42 → needs profile, settings, counts" }],
+          "output": [{ "name": "Data calls", "type": "get(key) · save(entity)" }]
+        },
+        "responsibilities": [
+          "Read through the data-access layer rather than calling cache and database ad hoc.",
+          "Keep a tiny in-process cache for the very hottest keys.",
+          "Degrade gracefully when the cache is slow or down."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Cache cluster fully down",
+            "impact": "Every read hits the database, which cannot handle the load.",
+            "mitigation": "Circuit breaker, request shedding, and serving stale L1 values while the cache recovers."
+          },
+          {
+            "scenario": "Caching personalised data under a shared key",
+            "impact": "One user sees another user's data.",
+            "mitigation": "Include the user or tenant ID in every key; review key builders in code review."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dal",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Data Access Layer",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Cache client (mcrouter / Lettuce)", "Consistent hashing"],
+        "io": {
+          "input": [{ "name": "Call", "type": "get(key) / save(entity)" }],
+          "output": [
+            { "name": "Cache ops", "type": "GET · SET key value EX 3600 · lease tokens" },
+            { "name": "DB ops", "type": "SELECT on miss · UPDATE on write" }
+          ]
+        },
+        "responsibilities": [
+          "Implements cache-aside: try the cache, fall back to the database, populate on miss.",
+          "Maps keys to shards with a consistent-hash ring using virtual nodes.",
+          "Coalesces concurrent misses for the same key into one database read."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Thundering herd on a hot key's expiry",
+            "impact": "Thousands of identical database queries at once.",
+            "mitigation": "Leases or a per-key lock, plus early probabilistic refresh before expiry."
+          },
+          {
+            "scenario": "Plain modulo hashing (key % N)",
+            "impact": "Adding one node remaps almost every key, so the hit rate collapses.",
+            "mitigation": "Consistent hashing: adding a node moves only about 1/N of keys."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cache",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Cache Cluster (Primaries)",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Redis Cluster / Memcached", "LRU eviction"],
+        "io": {
+          "input": [{ "name": "Ops", "type": "GET / SET / DEL on hashed key slots" }],
+          "output": [{ "name": "Value", "type": "Serialized object or miss (~0.2 ms)" }]
+        },
+        "responsibilities": [
+          "Holds the working set in RAM, sharded across many nodes.",
+          "Evicts least-recently-used keys when memory fills.",
+          "Expires keys by TTL so stale data cannot live forever."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Hot key exceeds one node's capacity",
+            "impact": "That shard's CPU or network saturates and latency spikes for its keys.",
+            "mitigation": "Replicate hot keys under suffixed names, or cache them in L1 on app servers."
+          },
+          {
+            "scenario": "Big values (multi-MB lists)",
+            "impact": "Slow commands block the single-threaded server.",
+            "mitigation": "Cap value size; split large objects; watch the slow log."
+          }
+        ]
+      }
+    },
+    {
+      "id": "db",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Database (Source of Truth)",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Postgres / MySQL", "Commit log (WAL / binlog)"],
+        "io": {
+          "input": [{ "name": "Queries", "type": "Reads on miss · all writes" }],
+          "output": [{ "name": "Changes", "type": "Committed row changes in the log" }]
+        },
+        "responsibilities": [
+          "Owns the correct value of every record.",
+          "Handles all writes; the cache never accepts writes the database has not seen.",
+          "Exposes its commit log for change capture."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Sized for cached traffic only",
+            "impact": "A mass cache miss (cold start, flush) overloads it.",
+            "mitigation": "Warm caches before cutover; rate-limit misses; never flush everything at once."
+          },
+          {
+            "scenario": "Read replica lag used to repopulate the cache",
+            "impact": "An old value is cached right after a write.",
+            "mitigation": "Read from the primary on misses that follow a recent write, or delay the invalidation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "invalidation",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Invalidation Pipeline",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Debezium CDC", "Kafka"],
+        "io": {
+          "input": [{ "name": "Row change", "type": "{ table: users, pk: 42, op: UPDATE, lsn }" }],
+          "output": [{ "name": "Deletes", "type": "DEL user:42:profile (+ dependent keys)" }]
+        },
+        "responsibilities": [
+          "Turns every committed write into deletes of the cache keys it affects.",
+          "Works for writes from any service, script, or migration, not just the main app.",
+          "Retries deletes until they succeed."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Pipeline lags behind",
+            "impact": "Users see stale data for minutes.",
+            "mitigation": "Alert on lag; keep TTLs short enough to bound staleness anyway."
+          },
+          {
+            "scenario": "Delete races with a concurrent miss-fill",
+            "impact": "Old value written back right after the delete, cached until TTL.",
+            "mitigation": "Leases are invalidated by the delete, so the late fill is rejected."
+          }
+        ]
+      }
+    },
+    {
+      "id": "replicas",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Cache Replicas",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Async replication", "Sentinel / cluster failover"],
+        "io": {
+          "input": [{ "name": "Stream", "type": "Primary's write stream per shard" }],
+          "output": [{ "name": "Failover", "type": "Promoted to primary when the old one fails" }]
+        },
+        "responsibilities": [
+          "Keep a warm copy of each shard in another zone.",
+          "Take over within seconds when a primary fails.",
+          "Optionally serve reads for very hot shards."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Async replication drops recent writes on failover",
+            "impact": "A few deletes are lost, so stale values may reappear.",
+            "mitigation": "Acceptable for a cache: the TTL bounds it; re-run invalidations after failover."
+          },
+          {
+            "scenario": "Split brain: two primaries for one shard",
+            "impact": "Conflicting values.",
+            "mitigation": "Quorum-based failover; fence the old primary."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-app-dal", "source": "app", "sourceHandle": "r", "target": "dal", "targetHandle": "l", "data": { "flow": "read", "payload": "get(key) / save()", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-dal-cache", "source": "dal", "sourceHandle": "t", "target": "cache", "targetHandle": "l", "data": { "flow": "read", "payload": "GET → hit · SET with TTL", "steps": [2, 4], "bidirectional": true } },
+    { "id": "e-dal-db", "source": "dal", "sourceHandle": "b", "target": "db", "targetHandle": "l", "data": { "flow": "read", "payload": "read on miss · write", "steps": [3, 5], "bidirectional": true } },
+    { "id": "e-db-invalidation", "source": "db", "sourceHandle": "r", "target": "invalidation", "targetHandle": "l", "data": { "flow": "write", "payload": "CDC row changes", "steps": [6] } },
+    { "id": "e-invalidation-cache", "source": "invalidation", "sourceHandle": "t", "target": "cache", "targetHandle": "b", "data": { "flow": "write", "payload": "DEL keys", "steps": [7] } },
+    { "id": "e-cache-replicas", "source": "cache", "sourceHandle": "r", "target": "replicas", "targetHandle": "l", "data": { "flow": "replication", "payload": "async replication", "steps": [8] } }
+  ]
+}

@@ -1,0 +1,226 @@
+{
+  "schemaVersion": 1,
+  "id": "feature-flags",
+  "title": "Feature Flags",
+  "summary": "Feature flags separate deploying code from releasing it. New code ships switched off, then a rule turns it on for 1% of users, then 10%, then everyone, or off again in seconds if something breaks. To keep this fast and reliable, flag rules are streamed to SDKs inside each service, and every check is evaluated locally in memory with no network call.",
+  "flows": {
+    "change": { "label": "Flag change", "color": "#a78bfa" },
+    "delivery": { "label": "Rule delivery", "color": "#38bdf8" },
+    "feedback": { "label": "Exposure & feedback", "color": "#34d399", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Write a targeting rule", "text": "An engineer sets new-checkout to: on for internal staff, 5% of US iOS users, off for everyone else." },
+    { "step": 2, "title": "Save, version, audit", "text": "The change is validated, optionally approved by a second person, and stored as a new version with who changed what and why." },
+    { "step": 3, "title": "Publish the change", "text": "A change event goes to the streaming relay, which holds open connections to every SDK." },
+    { "step": 4, "title": "SDKs update in milliseconds", "text": "Each SDK receives the new ruleset over SSE and swaps it into memory. A freshly started service first downloads the full ruleset and caches it locally." },
+    { "step": 5, "title": "Evaluate locally", "text": "isEnabled('new-checkout', user) runs in memory in microseconds: hash(flagKey + userId) mod 100 gives a stable bucket, so a user stays in or out across requests and servers." },
+    { "step": 6, "title": "Record exposures", "text": "SDKs batch 'user X saw variant Y' events to analytics, so impact can be measured and stale flags spotted." },
+    { "step": 7, "title": "Watch and react", "text": "Dashboards compare error rates and metrics by variant. If the treatment breaks something, one click (or an automatic guardrail) turns it off everywhere." }
+  ],
+  "nodes": [
+    {
+      "id": "console",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Flag Console",
+        "layer": "client",
+        "criticality": "async",
+        "tech": ["Web UI", "CLI / Terraform"],
+        "io": {
+          "input": [{ "name": "Insights", "type": "Exposure counts, metric impact, stale-flag alerts" }],
+          "output": [{ "name": "Change", "type": "{ flag: 'new-checkout', rules: [...], rollout: 5% }" }]
+        },
+        "responsibilities": [
+          "Lets engineers and PMs create flags, targeting rules, and percentage rollouts.",
+          "Separates environments so staging changes never touch production.",
+          "Provides a kill switch that anyone on call can use."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Wrong environment selected",
+            "impact": "A half-finished feature turned on in production.",
+            "mitigation": "Clear environment styling, approvals for production, and change previews."
+          },
+          {
+            "scenario": "Flag debt: hundreds of stale flags",
+            "impact": "Code paths nobody understands; risky to remove.",
+            "mitigation": "Owner and expiry date per flag; alerts for flags at 100% for 30+ days."
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Flag Management API",
+        "layer": "gateway",
+        "criticality": "degradable",
+        "tech": ["REST API", "RBAC + approvals"],
+        "io": {
+          "input": [{ "name": "Change request", "type": "PATCH /flags/new-checkout + author" }],
+          "output": [
+            { "name": "Save", "type": "New ruleset version + audit entry" },
+            { "name": "Event", "type": "FlagChanged { env, flag, version }" }
+          ]
+        },
+        "responsibilities": [
+          "Validates rules: referenced segments exist, percentages add up.",
+          "Enforces permissions and approval workflows per environment.",
+          "Publishes each change exactly once to the relay."
+        ],
+        "failureModes": [
+          {
+            "scenario": "API down during an incident",
+            "impact": "The kill switch cannot be flipped.",
+            "mitigation": "Run it separately from the product's infrastructure; a break-glass path that edits the store directly."
+          },
+          {
+            "scenario": "Concurrent edits",
+            "impact": "One person's rule silently overwrites another's.",
+            "mitigation": "Optimistic versioning: reject saves based on an old version."
+          }
+        ]
+      }
+    },
+    {
+      "id": "store",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Flag Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Postgres", "CDN-cached snapshots"],
+        "io": {
+          "input": [{ "name": "Versions", "type": "Ruleset per environment, monotonically versioned" }],
+          "output": [{ "name": "Snapshot", "type": "GET /sdk/rules?env=prod → full JSON ruleset" }]
+        },
+        "responsibilities": [
+          "Stores every flag version and the full audit history.",
+          "Serves complete rulesets for SDK start-up, cached at a CDN.",
+          "Supports rollback to any earlier version."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Store unreachable at service start-up",
+            "impact": "New instances have no rules.",
+            "mitigation": "SDKs ship with code defaults and a locally cached last-known ruleset."
+          },
+          {
+            "scenario": "Huge ruleset (thousands of user IDs inline)",
+            "impact": "Slow start-up and memory bloat in every service.",
+            "mitigation": "Reference segments by ID; evaluate large lists server-side."
+          }
+        ]
+      }
+    },
+    {
+      "id": "relay",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Streaming Relay",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["Server-Sent Events", "Regional relays"],
+        "io": {
+          "input": [{ "name": "Change event", "type": "FlagChanged { version }" }],
+          "output": [{ "name": "Push", "type": "SSE patch to every connected SDK (< 1 s)" }]
+        },
+        "responsibilities": [
+          "Keeps long-lived connections to thousands of SDK instances.",
+          "Fans each change out to every subscriber in an environment.",
+          "Lets SDKs resume from their last version after a reconnect."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Relay outage",
+            "impact": "SDKs keep their last rules; changes, including kill switches, stop propagating.",
+            "mitigation": "SDKs fall back to polling every 30 s; multi-region relays."
+          },
+          {
+            "scenario": "Reconnect storm after a relay restart",
+            "impact": "Thousands of SDKs reconnect and re-download at once.",
+            "mitigation": "Jittered reconnect delays; resume from version instead of a full download."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sdk",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Server SDK (in each service)",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["In-memory ruleset", "Deterministic hashing"],
+        "io": {
+          "input": [{ "name": "Check", "type": "isEnabled('new-checkout', { userId, country, platform })" }],
+          "output": [{ "name": "Variant", "type": "true / false or 'treatment-b' in microseconds" }]
+        },
+        "responsibilities": [
+          "Evaluates every flag locally with no network call on the request path.",
+          "Buckets users with a stable hash so the same user always gets the same variant.",
+          "Returns the coded default if anything goes wrong."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Unsafe default in code",
+            "impact": "If rules fail to load, an unfinished feature turns on.",
+            "mitigation": "Defaults always mean 'old, safe behaviour'; lint for it."
+          },
+          {
+            "scenario": "Bucketing by session instead of user",
+            "impact": "Users flip between variants and see a flickering UI.",
+            "mitigation": "Bucket on a stable ID; hash with the flag key so flags are independent."
+          }
+        ]
+      }
+    },
+    {
+      "id": "analytics",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Exposure Analytics",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Event pipeline", "Metric guardrails"],
+        "io": {
+          "input": [{ "name": "Exposures", "type": "Batched { flag, variant, userId, ts }" }],
+          "output": [{ "name": "Signals", "type": "Impact by variant, auto-rollback triggers, stale flags" }]
+        },
+        "responsibilities": [
+          "Counts who saw which variant and when.",
+          "Joins exposures with error rates and business metrics.",
+          "Triggers automatic rollback when a guardrail metric degrades."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Exposure volume explodes (logged every evaluation)",
+            "impact": "Huge event bills.",
+            "mitigation": "Deduplicate per user per flag per period in the SDK."
+          },
+          {
+            "scenario": "Guardrail too sensitive",
+            "impact": "Rollouts auto-revert on noise.",
+            "mitigation": "Minimum sample sizes and sequential testing before acting."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-console-api", "source": "console", "sourceHandle": "r", "target": "api", "targetHandle": "l", "data": { "flow": "change", "payload": "edit rule", "steps": [1] } },
+    { "id": "e-api-store", "source": "api", "sourceHandle": "t", "target": "store", "targetHandle": "l", "data": { "flow": "change", "payload": "new version + audit", "steps": [2] } },
+    { "id": "e-api-relay", "source": "api", "sourceHandle": "b", "target": "relay", "targetHandle": "l", "data": { "flow": "change", "payload": "FlagChanged", "steps": [3] } },
+    { "id": "e-relay-sdk", "source": "relay", "sourceHandle": "r", "target": "sdk", "targetHandle": "b", "data": { "flow": "delivery", "payload": "SSE push", "steps": [4] } },
+    { "id": "e-store-sdk", "source": "store", "sourceHandle": "r", "target": "sdk", "targetHandle": "t", "data": { "flow": "delivery", "payload": "bootstrap snapshot", "steps": [4] } },
+    { "id": "e-sdk-analytics", "source": "sdk", "sourceHandle": "r", "target": "analytics", "targetHandle": "l", "data": { "flow": "feedback", "payload": "local eval → exposures", "steps": [5, 6] } },
+    { "id": "e-analytics-console", "source": "analytics", "sourceHandle": "t", "target": "console", "targetHandle": "t", "data": { "flow": "feedback", "payload": "impact · kill switch", "steps": [7] } }
+  ]
+}

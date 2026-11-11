@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "id": "subscription-billing",
+  "title": "Subscription Billing",
+  "summary": "Subscription billing turns plans and usage into correct invoices, month after month. It records who is on which plan, prorates mid-cycle changes, collects metered usage, generates invoices on each customer's renewal date, and charges the card on file. When a charge fails it retries on a schedule (dunning) before downgrading access, because a large share of churn is failed cards rather than unhappy customers.",
+  "flows": {
+    "lifecycle": { "label": "Subscription lifecycle", "color": "#38bdf8" },
+    "billing": { "label": "Billing run", "color": "#a78bfa" },
+    "collection": { "label": "Collection & dunning", "color": "#f472b6" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Subscribe or change plan", "text": "A customer upgrades from Starter ($20/mo) to Pro ($50/mo) on day 10 of their billing cycle." },
+    { "step": 2, "title": "Price and prorate", "text": "The catalog provides Pro's price. The service credits the unused 20 days of Starter, charges 20 days of Pro, and records a new subscription version effective now." },
+    { "step": 3, "title": "Meter usage", "text": "The product reports usage events (API calls, seats, GB stored) with idempotency keys. They are aggregated per subscription and billing period." },
+    { "step": 4, "title": "Generate invoices", "text": "On each customer's renewal date the billing run builds an invoice: next month's Pro fee in advance, last month's metered usage in arrears, proration lines, discounts, and tax." },
+    { "step": 5, "title": "Charge the payment method", "text": "The invoice is finalised (immutable from now on) and charged to the saved card, using the invoice ID as idempotency key." },
+    { "step": 6, "title": "Dunning on failure", "text": "A declined charge enters dunning: retries at smart times (after payday, different hour), card-updater checks, and emails asking the customer to update their card." },
+    { "step": 7, "title": "Update entitlements", "text": "Payment webhooks drive access. Paid keeps Pro on. Still unpaid after the final retry moves the account to past-due, then downgraded or cancelled." }
+  ],
+  "nodes": [
+    {
+      "id": "customer",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 240 },
+      "data": {
+        "label": "Customer & Product",
+        "layer": "client",
+        "criticality": "degradable",
+        "tech": ["Checkout / billing portal", "Entitlement checks"],
+        "io": {
+          "input": [{ "name": "Status", "type": "Invoices, receipts, access level" }],
+          "output": [{ "name": "Actions", "type": "Subscribe, upgrade, cancel, update card" }]
+        },
+        "responsibilities": [
+          "Lets customers choose plans and manage billing themselves.",
+          "Gates features by the customer's current entitlements.",
+          "Shows clear invoices and upcoming charges."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Entitlements read from billing on every request",
+            "impact": "A billing outage locks paying customers out.",
+            "mitigation": "Cache entitlements locally; billing problems must never block product access."
+          },
+          {
+            "scenario": "Surprise charges",
+            "impact": "Chargebacks and angry customers.",
+            "mitigation": "Preview proration before confirming; renewal reminder emails."
+          }
+        ]
+      }
+    },
+    {
+      "id": "subscriptions",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Subscription Service",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["State machine", "Versioned subscriptions"],
+        "io": {
+          "input": [{ "name": "Change", "type": "{ customer, plan: pro, effective: now, prorate: true }" }],
+          "output": [{ "name": "Subscription", "type": "trialing → active → past_due → canceled" }]
+        },
+        "responsibilities": [
+          "Owns each subscription's state, plan, quantity, and billing anchor date.",
+          "Computes proration for mid-cycle changes.",
+          "Accepts usage reports and routes them to metering."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Proration rounding differences",
+            "impact": "Invoices off by cents; finance cannot reconcile.",
+            "mitigation": "Integer minor units, one documented rounding rule, golden tests."
+          },
+          {
+            "scenario": "Time-zone and month-length bugs",
+            "impact": "Renewals on 31 Feb, or double billing at DST changes.",
+            "mitigation": "Store anchors in UTC; clamp to month end; property-based tests."
+          }
+        ]
+      }
+    },
+    {
+      "id": "catalog",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Plans & Price Catalog",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Versioned prices", "Multi-currency"],
+        "io": {
+          "input": [{ "name": "Lookup", "type": "plan pro, USD, monthly" }],
+          "output": [{ "name": "Price", "type": "$50 flat + $0.002 per API call over 100k" }]
+        },
+        "responsibilities": [
+          "Defines plans, tiers, per-unit prices, and currencies.",
+          "Versions prices so existing customers keep theirs (grandfathering).",
+          "Holds coupons and discounts with their rules."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Editing a price in place",
+            "impact": "Existing subscribers silently charged more.",
+            "mitigation": "Prices are immutable; a change means a new price version and an explicit migration."
+          },
+          {
+            "scenario": "Stacked coupons",
+            "impact": "Negative or zero invoices.",
+            "mitigation": "Validation rules for coupon combinations; floor at zero."
+          }
+        ]
+      }
+    },
+    {
+      "id": "metering",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Usage Metering",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Event ingestion", "Aggregation by period"],
+        "io": {
+          "input": [{ "name": "Usage events", "type": "{ sub, metric: api_calls, qty: 1, ts, idempotencyKey }" }],
+          "output": [{ "name": "Totals", "type": "Usage per subscription per period" }]
+        },
+        "responsibilities": [
+          "Ingests high-volume usage events with deduplication.",
+          "Aggregates them by billing period, respecting late arrivals.",
+          "Gives customers a live view of usage so far."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Duplicate events counted",
+            "impact": "Customers overbilled.",
+            "mitigation": "Idempotency keys; reconcile against product-side counters."
+          },
+          {
+            "scenario": "Events arrive after the invoice is final",
+            "impact": "Usage is lost or billed late.",
+            "mitigation": "A grace window before closing a period; bill late usage on the next invoice."
+          }
+        ]
+      }
+    },
+    {
+      "id": "invoicing",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 240 },
+      "data": {
+        "label": "Invoicing Engine",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["Scheduled billing runs", "Tax service"],
+        "io": {
+          "input": [{ "name": "Inputs", "type": "Subscriptions due today + prices + usage" }],
+          "output": [{ "name": "Invoice", "type": "Line items + tax → finalised, numbered PDF" }]
+        },
+        "responsibilities": [
+          "Builds invoices on each renewal date, spread out to avoid one giant month-start run.",
+          "Calculates tax by customer location.",
+          "Finalises invoices as immutable documents and posts them to the ledger."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Billing run crashes halfway",
+            "impact": "Some customers billed twice or not at all.",
+            "mitigation": "Idempotent per-subscription-period jobs; resume safely."
+          },
+          {
+            "scenario": "Invoice edited after sending",
+            "impact": "Audit and tax problems.",
+            "mitigation": "Finalised invoices are immutable; corrections use credit notes."
+          }
+        ]
+      }
+    },
+    {
+      "id": "payments",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Payment Processor",
+        "layer": "external",
+        "criticality": "critical",
+        "tech": ["Saved cards / SEPA / ACH", "Network card updater"],
+        "io": {
+          "input": [{ "name": "Charge", "type": "Invoice amount, payment method, idempotency key" }],
+          "output": [{ "name": "Webhooks", "type": "invoice.paid / payment_failed (decline code)" }]
+        },
+        "responsibilities": [
+          "Charges saved payment methods for recurring invoices.",
+          "Refreshes expired card numbers automatically via the card networks.",
+          "Reports outcomes and decline reasons."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retry after a timeout charges twice",
+            "impact": "Customer billed twice for one invoice.",
+            "mitigation": "Invoice ID as idempotency key on every charge attempt."
+          },
+          {
+            "scenario": "Mass expiry of cards",
+            "impact": "Involuntary churn spikes.",
+            "mitigation": "Card updater services plus pre-expiry reminders."
+          }
+        ]
+      }
+    },
+    {
+      "id": "dunning",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 480 },
+      "data": {
+        "label": "Dunning & Recovery",
+        "layer": "processing",
+        "criticality": "async",
+        "tech": ["Retry scheduler", "Recovery emails"],
+        "io": {
+          "input": [{ "name": "Failure", "type": "payment_failed { code: insufficient_funds }" }],
+          "output": [{ "name": "Plan", "type": "Retries over ~2-3 weeks, emails, final action" }]
+        },
+        "responsibilities": [
+          "Retries failed charges at times most likely to succeed.",
+          "Treats soft declines (retry) differently from hard declines (ask for a new card).",
+          "Hands off to downgrade or cancel after the last attempt."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Retrying hard declines (stolen card)",
+            "impact": "Processor fees and fraud flags on your account.",
+            "mitigation": "Never retry hard decline codes; request a new method instead."
+          },
+          {
+            "scenario": "Customer updates card but no retry happens",
+            "impact": "Willing customer still marked unpaid.",
+            "mitigation": "Retry open invoices immediately on a card update."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-customer-subs", "source": "customer", "sourceHandle": "r", "target": "subscriptions", "targetHandle": "l", "data": { "flow": "lifecycle", "payload": "subscribe / upgrade", "steps": [1], "bidirectional": true } },
+    { "id": "e-subs-catalog", "source": "subscriptions", "sourceHandle": "t", "target": "catalog", "targetHandle": "l", "data": { "flow": "lifecycle", "payload": "price + proration", "steps": [2], "bidirectional": true } },
+    { "id": "e-subs-metering", "source": "subscriptions", "sourceHandle": "b", "target": "metering", "targetHandle": "l", "data": { "flow": "lifecycle", "payload": "usage events", "steps": [3] } },
+    { "id": "e-catalog-invoicing", "source": "catalog", "sourceHandle": "r", "target": "invoicing", "targetHandle": "t", "data": { "flow": "billing", "payload": "plans + subscriptions due", "steps": [4] } },
+    { "id": "e-metering-invoicing", "source": "metering", "sourceHandle": "r", "target": "invoicing", "targetHandle": "b", "data": { "flow": "billing", "payload": "usage totals", "steps": [4] } },
+    { "id": "e-invoicing-payments", "source": "invoicing", "sourceHandle": "r", "target": "payments", "targetHandle": "l", "data": { "flow": "collection", "payload": "charge invoice", "steps": [5], "bidirectional": true } },
+    { "id": "e-payments-dunning", "source": "payments", "sourceHandle": "b", "target": "dunning", "targetHandle": "t", "data": { "flow": "collection", "payload": "declines ⇄ smart retries", "steps": [6], "bidirectional": true } },
+    { "id": "e-payments-customer", "source": "payments", "sourceHandle": "t", "target": "customer", "targetHandle": "t", "data": { "flow": "collection", "payload": "webhooks → entitlements", "steps": [7] } }
+  ]
+}

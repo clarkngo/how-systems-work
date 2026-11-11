@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 1,
+  "id": "live-streaming",
+  "title": "Live Streaming",
+  "summary": "Live streaming is video on demand with no time to prepare. The broadcaster's stream must be received, encoded into several qualities, packaged, and spread across a CDN within a few seconds, continuously, for hours. Low-latency HLS keeps viewers two to five seconds behind real life by delivering tiny partial segments the moment they exist, while a separate chat system fans messages out to everyone watching.",
+  "flows": {
+    "contribution": { "label": "Contribution (broadcaster → cloud)", "color": "#a78bfa" },
+    "delivery": { "label": "Delivery to viewers", "color": "#38bdf8" },
+    "chat": { "label": "Live chat", "color": "#fbbf24" }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Broadcaster goes live", "text": "OBS pushes the stream over RTMP or SRT to the nearest ingest point, authenticating with a secret stream key." },
+    { "step": 2, "title": "Ingest validates and forwards", "text": "The ingest edge checks the key and the stream's health (bitrate, keyframe interval), then forwards it over the provider's private backbone to a transcoding region." },
+    { "step": 3, "title": "Transcode in real time", "text": "GPU or ASIC encoders produce a ladder (1080p60 down to 160p) faster than real time, with aligned keyframes so players can switch quality cleanly." },
+    { "step": 4, "title": "Package as low-latency parts", "text": "The origin cuts each rendition into 2-second segments made of ~200 ms CMAF parts and publishes each part to the playlist the moment it is encoded." },
+    { "step": 5, "title": "Viewers pull from the CDN", "text": "Players request the playlist with a blocking reload: the CDN holds the request until the next part exists, then serves it. Thousands of viewers on one edge share a single origin fetch." },
+    { "step": 6, "title": "Chat in parallel", "text": "Chat travels over WebSockets with fan-out by channel. The broadcaster sees it too, so the delay between video and chat is what makes the stream feel interactive." },
+    { "step": 7, "title": "Record for replay", "text": "Segments are also written to object storage, so the stream is available as VOD as soon as it ends." }
+  ],
+  "nodes": [
+    {
+      "id": "broadcaster",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Broadcaster",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["OBS / mobile app", "RTMP / SRT / WebRTC"],
+        "io": {
+          "input": [{ "name": "Chat", "type": "Viewer messages in real time" }],
+          "output": [{ "name": "Stream", "type": "H.264 1080p60 ~6 Mbps + AAC audio" }]
+        },
+        "responsibilities": [
+          "Encodes camera and screen in real time on their own hardware.",
+          "Keeps a stable upload bitrate and a regular keyframe interval (e.g. 2 s).",
+          "Reacts to chat as part of the show."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Home upload bandwidth drops",
+            "impact": "Frames are dropped; every viewer sees stutter.",
+            "mitigation": "SRT with retransmission; encoder adapts bitrate; warn the streamer."
+          },
+          {
+            "scenario": "Stream key leaked",
+            "impact": "Someone else broadcasts on the channel.",
+            "mitigation": "Regenerable keys, one active session per key, alert on unusual IPs."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ingest",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 0 },
+      "data": {
+        "label": "Ingest Edge",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["Global ingest PoPs", "Private backbone"],
+        "io": {
+          "input": [{ "name": "Contribution", "type": "rtmp://ingest/live/{streamKey}" }],
+          "output": [{ "name": "Forwarded", "type": "Validated stream to a transcode region" }]
+        },
+        "responsibilities": [
+          "Accepts streams close to the broadcaster to minimise packet loss.",
+          "Authenticates stream keys and starts the session.",
+          "Moves the stream over a managed network rather than the public internet."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Ingest node fails mid-stream",
+            "impact": "Stream drops for every viewer.",
+            "mitigation": "Broadcaster reconnects to another PoP; players hold a short buffer to ride it out."
+          },
+          {
+            "scenario": "Malformed stream (no keyframes)",
+            "impact": "Players cannot start or switch quality.",
+            "mitigation": "Validate on ingest and reject with a clear error to the broadcaster."
+          }
+        ]
+      }
+    },
+    {
+      "id": "transcode",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Real-time Transcoder",
+        "layer": "processing",
+        "criticality": "critical",
+        "tech": ["GPU / VPU (ASIC) encoders", "One job per live channel"],
+        "io": {
+          "input": [{ "name": "Source", "type": "Single high-bitrate stream" }],
+          "output": [{ "name": "Ladder", "type": "1080p60 · 720p · 480p · 160p, aligned GOPs" }]
+        },
+        "responsibilities": [
+          "Encodes several renditions at least as fast as real time, continuously.",
+          "Aligns keyframes across renditions for clean switching.",
+          "Passes the source straight through for small channels to save cost."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Encoder falls behind real time",
+            "impact": "Latency grows, then frames drop.",
+            "mitigation": "Capacity headroom per job; drop the top rendition before falling behind."
+          },
+          {
+            "scenario": "Huge simultaneous start (big event)",
+            "impact": "Not enough encoders for new channels.",
+            "mitigation": "Pre-provision for scheduled events; source-only fallback."
+          }
+        ]
+      }
+    },
+    {
+      "id": "origin",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 0 },
+      "data": {
+        "label": "Packager & Origin",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["LL-HLS / CMAF", "Partial segments"],
+        "io": {
+          "input": [{ "name": "Renditions", "type": "Encoded frames per rendition" }],
+          "output": [{ "name": "Media", "type": "Playlist + ~200 ms parts + 2 s segments" }]
+        },
+        "responsibilities": [
+          "Publishes each part as soon as it is encoded.",
+          "Answers blocking playlist requests the instant new parts appear.",
+          "Keeps a short rolling window of recent segments for live viewers."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Origin overloaded by direct viewer traffic",
+            "impact": "The stream fails for everyone.",
+            "mitigation": "Only CDN shields may fetch; request collapsing at the shield."
+          },
+          {
+            "scenario": "Clock drift between packagers",
+            "impact": "Playlist discontinuities cause player errors on failover.",
+            "mitigation": "Timestamps derived from the source; redundant packagers in sync."
+          }
+        ]
+      }
+    },
+    {
+      "id": "vod",
+      "type": "systemNode",
+      "position": { "x": 1520, "y": 0 },
+      "data": {
+        "label": "Recording / VOD",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Object storage", "Clip service"],
+        "io": {
+          "input": [{ "name": "Segments", "type": "All renditions as they are produced" }],
+          "output": [{ "name": "Replay", "type": "Full broadcast + clips available after the stream" }]
+        },
+        "responsibilities": [
+          "Archives every segment so the stream can be replayed.",
+          "Lets viewers make clips of moments during the stream.",
+          "Applies retention rules and copyright muting."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Archive writes lag",
+            "impact": "End of the stream missing from the replay.",
+            "mitigation": "Durable queue for segment uploads; finalise only when complete."
+          },
+          {
+            "scenario": "Copyrighted music in the recording",
+            "impact": "Takedowns against the channel.",
+            "mitigation": "Audio fingerprinting on VOD and muting of flagged sections."
+          }
+        ]
+      }
+    },
+    {
+      "id": "chat",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Live Chat",
+        "layer": "processing",
+        "criticality": "degradable",
+        "tech": ["WebSocket edge", "Pub/sub per channel"],
+        "io": {
+          "input": [{ "name": "Message", "type": "{ channel, user, text, ts }" }],
+          "output": [{ "name": "Fan-out", "type": "Message to every viewer in the channel" }]
+        },
+        "responsibilities": [
+          "Delivers messages to hundreds of thousands of viewers in under a second.",
+          "Applies slow mode, spam filters, and moderator tools.",
+          "Keeps chat working even if video falters."
+        ],
+        "failureModes": [
+          {
+            "scenario": "One channel with 1M chatters",
+            "impact": "Fan-out of 1M × messages per second.",
+            "mitigation": "Sample or batch messages for huge rooms; hierarchical fan-out across edge servers."
+          },
+          {
+            "scenario": "Spam raids",
+            "impact": "Chat unreadable; harassment.",
+            "mitigation": "Rate limits, follower-only mode, automated filters."
+          }
+        ]
+      }
+    },
+    {
+      "id": "viewers",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 480 },
+      "data": {
+        "label": "Viewers (Players)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["hls.js / native players", "Low-latency mode"],
+        "io": {
+          "input": [{ "name": "Media", "type": "Parts and segments from the CDN" }],
+          "output": [{ "name": "Requests", "type": "Blocking playlist reload + part fetches" }]
+        },
+        "responsibilities": [
+          "Plays a few seconds behind live, catching up gently by playing slightly faster.",
+          "Switches quality based on bandwidth.",
+          "Shows chat alongside the video."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Tiny buffer on a poor network",
+            "impact": "Frequent stalls.",
+            "mitigation": "Grow the target latency automatically for viewers with unstable connections."
+          },
+          {
+            "scenario": "Viewers drift to different delays",
+            "impact": "Chat reacts to moments some viewers have not seen yet.",
+            "mitigation": "Playback-rate control towards a common target latency."
+          }
+        ]
+      }
+    },
+    {
+      "id": "cdn",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "CDN Edges",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["LL-HLS-aware caching", "Request collapsing"],
+        "io": {
+          "input": [{ "name": "Requests", "type": "Thousands of viewers per edge" }],
+          "output": [{ "name": "Origin fetch", "type": "One fetch per part per edge" }]
+        },
+        "responsibilities": [
+          "Holds blocking requests and serves new parts to all waiting viewers at once.",
+          "Collapses identical requests into a single origin fetch.",
+          "Scales to millions of concurrent viewers for big events."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Edge does not support blocking reloads",
+            "impact": "Viewers poll; latency rises and origin load explodes.",
+            "mitigation": "Use LL-HLS-capable CDNs; fall back to standard HLS latency."
+          },
+          {
+            "scenario": "Flash crowd at stream start",
+            "impact": "Edge saturation in popular regions.",
+            "mitigation": "Multi-CDN with steering by real-time QoE."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-broadcaster-ingest", "source": "broadcaster", "sourceHandle": "r", "target": "ingest", "targetHandle": "l", "data": { "flow": "contribution", "payload": "RTMP / SRT", "steps": [1] } },
+    { "id": "e-ingest-transcode", "source": "ingest", "sourceHandle": "r", "target": "transcode", "targetHandle": "l", "data": { "flow": "contribution", "payload": "validated stream", "steps": [2] } },
+    { "id": "e-transcode-origin", "source": "transcode", "sourceHandle": "r", "target": "origin", "targetHandle": "l", "data": { "flow": "contribution", "payload": "ABR ladder", "steps": [3, 4] } },
+    { "id": "e-origin-vod", "source": "origin", "sourceHandle": "r", "target": "vod", "targetHandle": "l", "data": { "flow": "contribution", "payload": "archive", "steps": [7] } },
+    { "id": "e-cdn-origin", "source": "cdn", "sourceHandle": "t", "target": "origin", "targetHandle": "b", "data": { "flow": "delivery", "payload": "LL-HLS parts", "steps": [4, 5], "bidirectional": true } },
+    { "id": "e-viewers-cdn", "source": "viewers", "sourceHandle": "r", "target": "cdn", "targetHandle": "l", "data": { "flow": "delivery", "payload": "blocking reload ⇄ parts", "steps": [5], "bidirectional": true } },
+    { "id": "e-viewers-chat", "source": "viewers", "sourceHandle": "l", "target": "chat", "targetHandle": "r", "data": { "flow": "chat", "payload": "WebSocket chat", "steps": [6], "bidirectional": true } },
+    { "id": "e-chat-broadcaster", "source": "chat", "sourceHandle": "t", "target": "broadcaster", "targetHandle": "b", "data": { "flow": "chat", "payload": "chat overlay", "steps": [6] } }
+  ]
+}

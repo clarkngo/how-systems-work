@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "id": "collaborative-editing",
+  "title": "Collaborative Editing",
+  "summary": "Collaborative editors like Google Docs or Figma let several people type into the same document at once and still end up with identical copies. Each keystroke is applied locally right away and sent as an operation. A session server puts every operation for a document in one order, adjusting it for concurrent edits (OT) or merging it with a conflict-free data type (CRDT), and broadcasts it, so every copy converges.",
+  "flows": {
+    "ops": { "label": "Edit operations", "color": "#38bdf8" },
+    "persist": { "label": "Persistence", "color": "#a78bfa" },
+    "presence": { "label": "Presence (ephemeral)", "color": "#fbbf24", "animated": false }
+  },
+  "walkthrough": [
+    { "step": 1, "title": "Type locally, send an op", "text": "Alice types 'x' at position 5. Her editor shows it immediately (no waiting on the network) and sends insert('x', 5) tagged with the document revision it was based on." },
+    { "step": 2, "title": "Order and transform", "text": "The document's session server gives the op the next sequence number. If Bob's concurrent insert at position 2 landed first, Alice's op is transformed to position 6 so it still means the same thing." },
+    { "step": 3, "title": "Persist before acknowledging", "text": "The op is appended to the document's operation log. Only then is it acknowledged, so an acknowledged edit is never lost." },
+    { "step": 4, "title": "Broadcast to collaborators", "text": "Bob's editor receives the transformed op and applies it. Every client applies the same ops in the same order, so all copies converge." },
+    { "step": 5, "title": "Acknowledge and rebase", "text": "Alice gets her ack with the new revision. Any ops she typed meanwhile are rebased onto it, which is invisible to her." },
+    { "step": 6, "title": "Share cursors and presence", "text": "Cursor positions and 'who's here' go over a separate lossy channel. They are sent many times a second, never stored, and losing one is harmless." },
+    { "step": 7, "title": "Snapshot and compact", "text": "Every few hundred ops the server writes a full snapshot. A new joiner loads the latest snapshot plus the ops after it, instead of replaying years of history." }
+  ],
+  "nodes": [
+    {
+      "id": "editor-a",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 0 },
+      "data": {
+        "label": "Editor (Alice)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Local document model", "WebSocket"],
+        "io": {
+          "input": [{ "name": "Remote", "type": "Acks + others' ops + cursors" }],
+          "output": [{ "name": "Ops", "type": "{ op: insert, pos: 5, text: 'x', baseRev: 41 }" }]
+        },
+        "responsibilities": [
+          "Applies the user's edits instantly (optimistic local apply).",
+          "Keeps a queue of sent-but-unacknowledged ops and rebases them on incoming changes.",
+          "Works offline and syncs the queue when reconnected."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Long offline period with many edits",
+            "impact": "Large merges with surprising results.",
+            "mitigation": "CRDTs merge any order deterministically; show a 'changes merged' notice."
+          },
+          {
+            "scenario": "Client bug applies an op differently",
+            "impact": "Copies silently diverge.",
+            "mitigation": "Periodic checksums against the server; reload from snapshot on mismatch."
+          }
+        ]
+      }
+    },
+    {
+      "id": "editor-b",
+      "type": "systemNode",
+      "position": { "x": 0, "y": 480 },
+      "data": {
+        "label": "Editor (Bob)",
+        "layer": "client",
+        "criticality": "critical",
+        "tech": ["Same client", "Different device"],
+        "io": {
+          "input": [{ "name": "Remote", "type": "Alice's transformed op at rev 42" }],
+          "output": [{ "name": "Ops", "type": "His own concurrent edits" }]
+        },
+        "responsibilities": [
+          "Applies remote ops in server order.",
+          "Transforms remote ops against his own pending ones.",
+          "Renders collaborators' cursors and selections."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Missed op after a brief disconnect",
+            "impact": "A gap in sequence numbers, so the state is wrong.",
+            "mitigation": "Reconnect with the last seen revision; the server replays the missing ops."
+          },
+          {
+            "scenario": "Very slow device",
+            "impact": "Falls far behind a fast-typing team.",
+            "mitigation": "Batch ops; jump forward via snapshot if too far behind."
+          }
+        ]
+      }
+    },
+    {
+      "id": "server",
+      "type": "systemNode",
+      "position": { "x": 380, "y": 240 },
+      "data": {
+        "label": "Document Session Server",
+        "layer": "gateway",
+        "criticality": "critical",
+        "tech": ["One owner per doc (sticky routing)", "OT / CRDT engine"],
+        "io": {
+          "input": [{ "name": "Client ops", "type": "Ops from every editor of doc 123" }],
+          "output": [{ "name": "Ordered ops", "type": "Sequenced, transformed ops → log + broadcast" }]
+        },
+        "responsibilities": [
+          "Is the single place that orders ops for a document.",
+          "Transforms or merges concurrent ops so they converge.",
+          "Broadcasts committed ops and acks to all connected editors."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Session server crashes",
+            "impact": "Editors of its documents are briefly disconnected.",
+            "mitigation": "Another server takes over the doc, rebuilds from snapshot + log, and clients resume by revision."
+          },
+          {
+            "scenario": "Two servers think they own the same doc",
+            "impact": "Two orderings, so the document forks.",
+            "mitigation": "Lease-based ownership with fencing tokens on log appends."
+          }
+        ]
+      }
+    },
+    {
+      "id": "presence",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 0 },
+      "data": {
+        "label": "Presence & Cursors",
+        "layer": "storage",
+        "criticality": "async",
+        "tech": ["Redis pub/sub", "In-memory TTL"],
+        "io": {
+          "input": [{ "name": "Updates", "type": "{ user, cursor, selection, color } ~10/s" }],
+          "output": [{ "name": "Fan-out", "type": "Latest presence per user in the doc" }]
+        },
+        "responsibilities": [
+          "Shares who is viewing and where their cursor is.",
+          "Keeps only the latest state, dropping stale updates.",
+          "Expires users who disconnect without saying goodbye."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Presence stored with edits",
+            "impact": "The log fills with cursor noise.",
+            "mitigation": "Keep presence entirely separate and ephemeral."
+          },
+          {
+            "scenario": "Large audience (1,000 viewers)",
+            "impact": "N² cursor updates.",
+            "mitigation": "Throttle and show only active editors' cursors."
+          }
+        ]
+      }
+    },
+    {
+      "id": "oplog",
+      "type": "systemNode",
+      "position": { "x": 760, "y": 480 },
+      "data": {
+        "label": "Operation Log",
+        "layer": "storage",
+        "criticality": "critical",
+        "tech": ["Append-only per doc", "Spanner / Postgres"],
+        "io": {
+          "input": [{ "name": "Append", "type": "(docId, rev 42, op, author, ts) IF rev = 41" }],
+          "output": [{ "name": "Replay", "type": "Ops after revision N" }]
+        },
+        "responsibilities": [
+          "Durably stores every op in order: the document's full history.",
+          "Rejects appends that skip or duplicate a revision.",
+          "Powers version history and 'see who changed this'."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Append latency spikes",
+            "impact": "Acks slow down; editing feels laggy for everyone.",
+            "mitigation": "Batch appends; keep the log close to the session server."
+          },
+          {
+            "scenario": "Unbounded growth",
+            "impact": "Large storage and slow loads for old documents.",
+            "mitigation": "Snapshots plus archiving old ops to cold storage."
+          }
+        ]
+      }
+    },
+    {
+      "id": "snapshots",
+      "type": "systemNode",
+      "position": { "x": 1140, "y": 480 },
+      "data": {
+        "label": "Snapshot Store",
+        "layer": "storage",
+        "criticality": "degradable",
+        "tech": ["Object storage", "Compaction worker"],
+        "io": {
+          "input": [{ "name": "Compaction", "type": "State at rev 4000 built from previous snapshot + ops" }],
+          "output": [{ "name": "Load", "type": "Snapshot + tail ops for opening a doc" }]
+        },
+        "responsibilities": [
+          "Stores periodic full copies of each document.",
+          "Makes opening a document fast regardless of its history length.",
+          "Provides restore points for version history."
+        ],
+        "failureModes": [
+          {
+            "scenario": "Corrupt snapshot",
+            "impact": "Document fails to open.",
+            "mitigation": "Verify by replaying; fall back to the previous snapshot plus more ops."
+          },
+          {
+            "scenario": "Compaction falls behind",
+            "impact": "Slow opens for busy documents.",
+            "mitigation": "Trigger compaction by op count, not just time."
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e-a-server", "source": "editor-a", "sourceHandle": "r", "target": "server", "targetHandle": "l", "data": { "flow": "ops", "payload": "op ⇄ ack + rebase", "steps": [1, 5], "bidirectional": true } },
+    { "id": "e-b-server", "source": "editor-b", "sourceHandle": "r", "target": "server", "targetHandle": "l", "data": { "flow": "ops", "payload": "broadcast ops", "steps": [4], "bidirectional": true } },
+    { "id": "e-server-oplog", "source": "server", "sourceHandle": "b", "target": "oplog", "targetHandle": "l", "data": { "flow": "persist", "payload": "sequence · transform · append", "steps": [2, 3] } },
+    { "id": "e-server-presence", "source": "server", "sourceHandle": "t", "target": "presence", "targetHandle": "l", "data": { "flow": "presence", "payload": "cursors (lossy)", "steps": [6], "bidirectional": true } },
+    { "id": "e-oplog-snapshots", "source": "oplog", "sourceHandle": "r", "target": "snapshots", "targetHandle": "l", "data": { "flow": "persist", "payload": "compact every N ops", "steps": [7] } }
+  ]
+}
